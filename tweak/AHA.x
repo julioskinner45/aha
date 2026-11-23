@@ -42,6 +42,9 @@
 #import <unistd.h>
 #import <stdio.h>
 
+// MSHookMessageEx（substrate）：Ajie delegate 动态 swizzle 同款，不 import substrate.h 直接声明
+extern "C" void MSHookMessageEx(Class _class, SEL message, IMP hook, IMP *result);
+
 static NSString *const kAhaCfgKey  = @"aha_cfg_v2";
 static NSString *const kAhaCrashKey = @"aha_last_crash_v1";
 static NSString *const kPdpMark   = @"/api/v4/pdp/";
@@ -106,6 +109,7 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
 - (void)inspectData:(NSData *)data response:(NSURLResponse *)resp
             request:(NSURLRequest *)req error:(NSError *)err;
 - (void)inspectJSON:(NSDictionary *)obj;                  // Ajie 同款：NSJSONSerialization 钩子喂进来的对象
+- (void)inspectRawBody:(NSString *)body url:(NSString *)u request:(NSURLRequest *)req;
 - (NSString *)bodyForShop:(NSString *)shop item:(NSString *)item;
 - (void)storeBody:(NSString *)body shop:(NSString *)shop item:(NSString *)item;
 - (NSDictionary *)contextCopy;
@@ -238,6 +242,55 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
     ahaLog(@"d", [NSString stringWithFormat:@"JSON 通道抓到 get_pc 回包 item %@ shop %@", iid, sid]);
     [self storeBody:body shop:sid item:iid];
   } @catch (__unused NSException *e) { /* 非目标 JSON，静默 */ }
+}
+
+// —— Ajie 1:1：delegate 会话的原始字节（didReceiveData 累积 + didComplete 收尾）在这里落库——
+// 不管虾皮用什么解析器，原始回包已在手；shop/item 优先从 URL query 取，取不到再按 JSON 形状识别
+- (void)inspectRawBody:(NSString *)body url:(NSString *)u request:(NSURLRequest *)req {
+  if (!gPool || body.length == 0) return;
+  @try {
+    if ([u rangeOfString:kGetPcMark].location == NSNotFound) return;
+    if (req && req.allHTTPHeaderFields.count) [self rememberContext:req];
+
+    // 风控识别（与 inspectData 同款；delegate 通道拿不到 HTTP 码，只看回包内容）
+    if ([body containsString:@"90309999"]) {
+      ahaLog(@"e", @"⛔ 命中风控墙（90309999，delegate 通道）——建议暂停歇会");
+      dispatch_async(gPool.q, ^{ [gPool riskHit]; });
+      ahaRefreshUI();
+      return;
+    }
+    if ([body containsString:@"266900002"]) {
+      ahaLog(@"w", @"⚠️ get_pc 报 266900002（delegate 通道）");
+      dispatch_async(gPool.q, ^{ [gPool riskHit]; });
+      ahaRefreshUI();
+      return;
+    }
+
+    // shop/item：URL query 优先（mall.shopee.tw 的 get_pc query 里带 item_id/shop_id）
+    NSString *shop = nil, *item = nil;
+    NSURLComponents *uc = [NSURLComponents componentsWithString:u];
+    for (NSURLQueryItem *qi in uc.queryItems ?: @[]) {
+      if ([qi.name isEqualToString:@"shop_id"]) shop = qi.value;
+      if ([qi.name isEqualToString:@"item_id"]) item = qi.value;
+    }
+    // query 没有 → 按 JSON 形状识别
+    if (!shop.length || !item.length) {
+      NSData *d = [body dataUsingEncoding:NSUTF8StringEncoding];
+      id obj = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+      if ([obj isKindOfClass:[NSDictionary class]]) {
+        id data = obj[@"data"], it = [data isKindOfClass:[NSDictionary class]] ? data[@"item"] : nil;
+        if ([it isKindOfClass:[NSDictionary class]]) {
+          if (!item.length) item = [NSString stringWithFormat:@"%@", it[@"item_id"] ?: it[@"itemid"] ?: @""];
+          if (!shop.length) shop = [NSString stringWithFormat:@"%@", it[@"shop_id"] ?: it[@"shopid"] ?: @""];
+        }
+      }
+    }
+    if (![item isKindOfClass:[NSString class]] || item.length == 0 || [item isEqualToString:@"(null)"]) return;
+    if (![shop isKindOfClass:[NSString class]] || shop.length == 0 || [shop isEqualToString:@"(null)"]) return;
+    dispatch_async(gPool.q, ^{ gPool.risk = NO; });
+    ahaLog(@"s", [NSString stringWithFormat:@"delegate 通道抓到 get_pc 回包 item %@ shop %@", item, shop]);
+    [self storeBody:body shop:shop item:item];
+  } @catch (__unused NSException *e) { /* 静默 */ }
 }
 @end
 
@@ -538,8 +591,11 @@ static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
   });
 }
 // —— 无 completionHandler 变体：delegate 式会话走这里，只观察不拦截（防漏看）——
+// pdp 请求头快照也在这里记（delegate 会话拿不到 completionHandler，这是 Direct PDP 头的唯一来源）
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
   ahaObserveURL(request.URL.absoluteString ?: @"");
+  if (request && [request.URL.absoluteString rangeOfString:kPdpMark].location != NSNotFound)
+    [[AHACapture shared] rememberContext:request];
   return %orig;
 }
 - (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)URL {
@@ -558,6 +614,102 @@ static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
     @try { [[AHACapture shared] inspectJSON:obj]; } @catch (__unused NSException *e) { /* 非目标 */ }
   }
   return obj;
+}
+%end
+
+#pragma mark - Ajie 1:1 第四钩：运行时 swizzle 虾皮 session 的 delegate（原始字节级抓包）
+
+// 虾皮用自己的原生 JSON 解析器（观察窗实锤：get_pc 走 delegate 会话且 NSJSONSerialization
+// 没命中）——照 Ajie 的做法：session 创建时拿 delegate 对象 → 对它的类动态装
+// URLSession:dataTask:didReceiveData: / URLSession:task:didCompleteWithError: 钩子，
+// 直接拿原始回包字节，解析器是什么都无所谓
+static IMP gOrigDidReceiveData = NULL;
+static IMP gOrigDidComplete    = NULL;
+static NSMutableDictionary *gDelegatesHooked = nil;   // 类名 → YES，防重复 swizzle
+static NSMutableDictionary *gTaskBuf = nil;           // task 指针串 → 累积的回包字节
+
+static void ahaDelegateDidReceiveData(id self, SEL _cmd, NSURLSession *session,
+                                      NSURLSessionDataTask *task, NSData *data);
+static void ahaDelegateDidComplete(id self, SEL _cmd, NSURLSession *session,
+                                   NSURLSessionTask *task, NSError *error);
+
+static void ahaSwizzleDelegate(id delegate) {
+  if (!delegate) return;
+  @try {
+    Class cls = object_getClass(delegate);
+    if (!cls) return;
+    if (!gDelegatesHooked) gDelegatesHooked = [NSMutableDictionary dictionary];
+    NSString *cn = NSStringFromClass(cls);
+    @synchronized (gDelegatesHooked) {
+      if (gDelegatesHooked[cn]) return;
+      gDelegatesHooked[cn] = @YES;   // 无论成败只装一次，防止递归
+    }
+    SEL selData = NSSelectorFromString(@"URLSession:dataTask:didReceiveData:");
+    SEL selDone = NSSelectorFromString(@"URLSession:task:didCompleteWithError:");
+    // 只装 delegate 真正实现了的（Ajie 同款 respondsToSelector 探测；默认实现没实现就不装）
+    if ([delegate respondsToSelector:selData])
+      MSHookMessageEx(cls, selData, (IMP)ahaDelegateDidReceiveData, &gOrigDidReceiveData);
+    if ([delegate respondsToSelector:selDone])
+      MSHookMessageEx(cls, selDone, (IMP)ahaDelegateDidComplete, &gOrigDidComplete);
+    ahaLog(@"d", [NSString stringWithFormat:@"已挂钩 session delegate：%@", cn]);
+  } @catch (__unused NSException *e) { /* 静默 */ }
+}
+
+static void ahaDelegateDidReceiveData(id self, SEL _cmd, NSURLSession *session,
+                                      NSURLSessionDataTask *task, NSData *data) {
+  @try {
+    if (!gTaskBuf) gTaskBuf = [NSMutableDictionary dictionary];
+    NSString *key = [NSString stringWithFormat:@"%p", task];
+    NSMutableData *buf = nil;
+    @synchronized (gTaskBuf) {
+      buf = gTaskBuf[key];
+      if (!buf) { buf = [NSMutableData data]; gTaskBuf[key] = buf; }
+      if (buf.length + data.length > 2 * 1024 * 1024) {   // 单任务 2MB 封顶，防吃内存
+        [gTaskBuf removeObjectForKey:key];
+      } else if (data.length) {
+        [buf appendData:data];
+      }
+      if (gTaskBuf.count > 128) {                          // 任务表防膨胀
+        NSString *first = gTaskBuf.allKeys.firstObject;
+        if (first) [gTaskBuf removeObjectForKey:first];
+      }
+    }
+  } @catch (__unused NSException *e) { /* 静默 */ }
+  if (gOrigDidReceiveData)
+    ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))gOrigDidReceiveData)
+        (self, _cmd, session, task, data);
+}
+
+static void ahaDelegateDidComplete(id self, SEL _cmd, NSURLSession *session,
+                                   NSURLSessionTask *task, NSError *error) {
+  @try {
+    NSString *key = [NSString stringWithFormat:@"%p", task];
+    NSData *bufData = nil;
+    @synchronized (gTaskBuf) {
+      NSMutableData *buf = gTaskBuf[key];
+      bufData = buf ? [NSData dataWithData:buf] : nil;
+      [gTaskBuf removeObjectForKey:key];
+    }
+    if (bufData && !error && task) {
+      NSURLRequest *req = task.currentRequest;
+      NSString *u = req.URL.absoluteString ?: @"";
+      if ([u rangeOfString:kGetPcMark].location != NSNotFound) {
+        NSString *body = [[NSString alloc] initWithData:bufData encoding:NSUTF8StringEncoding];
+        [[AHACapture shared] inspectRawBody:body url:u request:req];
+      }
+    }
+  } @catch (__unused NSException *e) { /* 静默 */ }
+  if (gOrigDidComplete)
+    ((void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *))gOrigDidComplete)
+        (self, _cmd, session, task, error);
+}
+
+%hook NSURLSession
++ (NSURLSession *)sessionWithConfiguration:(NSURLSessionConfiguration *)configuration
+    delegate:(id)delegate delegateQueue:(NSOperationQueue *)queue {
+  NSURLSession *s = %orig;
+  ahaSwizzleDelegate(delegate);   // 虾皮每建一个 session 就把它的 delegate 挂上钩
+  return s;
 }
 %end
 
