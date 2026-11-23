@@ -1,4 +1,4 @@
-// AHA.x — Shopee app 内采集客户端 v0.3.0（照 Ajie 0.1.3 实证架构重写）
+// AHA.x — Shopee app 内采集客户端 v0.4.0（敞口登录 + 大按钮合一 UI）
 //
 // 采集方式（Ajie 同款，不再用 NSURLProtocol——后台会话挂自定义协议会直接崩）：
 //   hook -[NSURLSession dataTaskWithRequest:completionHandler:] 与
@@ -12,9 +12,13 @@
 //
 // UI（Ajie 同款原生 UIKit，无 WebView 无 html）：
 //   悬浮窗（passthrough UIWindow，面板外触摸穿透回 app）
-//   header 可拖动 · ⚙设置（服务器/密码/休息） · — 收起成小球
-//   状态条 / 计数 / 任务行 · 账号输入框 · 间隔输入框 · 登录/开始/停止/清零
+//   header 可拖动 · ⚙设置（只有服务器地址） · — 收起成小球
+//   状态条 · 大号 成单计数 · 任务行 · 账号框 · 间隔/休息三个框
+//   一个大按钮 = 开始（自动登录）/ 停止，同一按钮切换 · 清零
 //   UITextView 日志窗（等宽字体自动滚底） · 右下角拉拽改面板大小
+//
+// 登录：敞口模式 —— 手机面板只填账号名（/api/pool/login），无任何密码字段。
+// 自签证书：中枢是自签 HTTPS，会话统一挂 AHATrustDelegate 接受 serverTrust。
 //
 // 全被动：不改任何请求/响应、不做检测绕过、不隐藏越狱。
 
@@ -165,6 +169,27 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
 }
 @end
 
+#pragma mark - 自签证书信任（中枢是自签 HTTPS，默认会话直接拒 → 图1那种「证书无效」登录失败）
+
+@interface AHATrustDelegate : NSObject <NSURLSessionDataDelegate> @end
+@implementation AHATrustDelegate
+- (void)URLSession:(NSURLSession *)session
+    didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
+    completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential *))h {
+  if ([challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodServerTrust])
+    h(NSURLSessionAuthChallengeUseCredential,
+      [NSURLCredential credentialForTrust:challenge.protectionSpace.serverTrust]);
+  else
+    h(NSURLSessionAuthChallengePerformDefaultHandling, nil);
+}
+@end
+
+static NSURLSession *AhaSession(NSURLSessionConfiguration *cfg) {
+  static AHATrustDelegate *td; static dispatch_once_t once;
+  dispatch_once(&once, ^{ td = [[AHATrustDelegate alloc] init]; });
+  return [NSURLSession sessionWithConfiguration:cfg delegate:td delegateQueue:nil];
+}
+
 #pragma mark - 观察钩子（Ajie 同款：包 completionHandler，不碰 protocolClasses）
 
 %hook NSURLSession
@@ -286,7 +311,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
   static NSURLSession *sess = nil;
   static dispatch_once_t once;
   dispatch_once(&once, ^{
-    sess = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration defaultSessionConfiguration]];
+    sess = AhaSession([NSURLSessionConfiguration defaultSessionConfiguration]);
   });
   [[sess dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
     id obj = (d && !e) ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
@@ -294,21 +319,21 @@ static void ahaLog(NSString *lv, NSString *msg) {
   }] resume];
 }
 
-// —— 登录 ——
+// —— 登录（敞口：只发账号名，无密码；中枢 /api/pool/login 发池专用 token）——
 - (void)connect:(void (^)(void))after {
   NSString *u = [self.cfg[@"user"] stringByTrimmingCharactersInSet:
       [NSCharacterSet whitespaceCharacterSet]];
-  if (u.length == 0) { ahaLog(@"w", @"先填租用账号"); ahaRefreshUI(); return; }
+  if (u.length == 0) { ahaLog(@"w", @"先填账号"); ahaRefreshUI(); return; }
   self.taskLine = @"";
-  [self api:@"/api/login" method:@"POST"
-      body:@{ @"name": u, @"pass": self.cfg[@"pass"] ?: @"" }
+  [self api:@"/api/pool/login" method:@"POST"
+      body:@{ @"name": u }
       done:^(NSDictionary *j, NSError *e) {
     dispatch_async(self.q, ^{
       if (j && [j[@"ok"] boolValue]) {
         self.token = j[@"token"];
-        self.me = [j[@"name"] isKindOfClass:[NSString class]] ? j[@"name"] : u;
+        self.me = u;
         self.connected = YES;
-        ahaLog(@"s", [NSString stringWithFormat:@"已连接 %@（租户池隔离）", self.me]);
+        ahaLog(@"s", [NSString stringWithFormat:@"已连接 %@（敞口模式 · 池隔离）", self.me]);
         if (after) after();
       } else {
         self.connected = NO; self.token = nil;
@@ -351,9 +376,9 @@ static void ahaLog(NSString *lv, NSString *msg) {
   });
 }
 
-// —— 调度 ——
+// —— 调度（间隔默认 0-0 秒：池子没单时听中枢 waitMs 节奏）——
 - (double)randomGap {
-  double lo = [self num:@"gapMin" def:8], hi = [self num:@"gapMax" def:20];
+  double lo = [self num:@"gapMin" def:0], hi = [self num:@"gapMax" def:0];
   if (hi < lo) hi = lo;
   return lo + arc4random_uniform((UInt32)(hi - lo + 1));
 }
@@ -475,8 +500,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
   }
   __block NSString *out = nil;
   dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-  [[[NSURLSession sessionWithConfiguration:
-      [NSURLSessionConfiguration ephemeralSessionConfiguration]]
+  [[[AhaSession([NSURLSessionConfiguration ephemeralSessionConfiguration])]
    dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
     if (!e && d) {
       NSHTTPURLResponse *hr = [r isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)r : nil;
@@ -506,8 +530,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
     static NSURLSession *sess = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-      sess = [NSURLSession sessionWithConfiguration:
-          [NSURLSessionConfiguration defaultSessionConfiguration]];
+      sess = AhaSession([NSURLSessionConfiguration defaultSessionConfiguration]);
     });
     [[sess dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
       dispatch_async(self.q, ^{
@@ -594,9 +617,9 @@ static void ahaTap(UIControl *c, void (^blk)(void)) {
 @property(nonatomic, strong) AHAPanel *panel;
 @property(nonatomic, strong) UIView *header, *mini;
 @property(nonatomic, strong) UILabel *ttl, *statusLabel, *taskLabel, *counterLabel, *miniInfo, *rh;
-@property(nonatomic, strong) UITextField *userField, *gapField;
+@property(nonatomic, strong) UITextField *userField, *gapField, *restEveryField, *restSecField;
 @property(nonatomic, strong) UITextView *logView;
-@property(nonatomic, strong) UIButton *gearBtn, *miniBtn, *loginBtn, *startBtn, *stopBtn, *resetBtn;
+@property(nonatomic, strong) UIButton *gearBtn, *miniBtn, *startBtn, *resetBtn;
 - (void)boot;
 - (void)layoutPanel;
 @end
@@ -648,8 +671,8 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
 
   CGFloat w = [gPool.cfg[@"panelW"] doubleValue] ?: 300;
   CGFloat h = [gPool.cfg[@"panelH"] doubleValue] ?: 380;
-  if (w < 260 || w > scr.size.width) w = 300;
-  if (h < 300 || h > scr.size.height) h = 380;
+  if (w < 280 || w > scr.size.width) w = 300;
+  if (h < 330 || h > scr.size.height) h = 380;
   CGFloat x = [gPool.cfg[@"panelX"] doubleValue] ?: 14;
   CGFloat y = [gPool.cfg[@"panelY"] doubleValue] ?: scr.size.height * 0.10;
   if (x < 0 || x + w > scr.size.width) x = 14;
@@ -679,32 +702,39 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   [hd addSubview:self.miniBtn];
   [hd addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:p action:@selector(ahaPan:)]];
 
-  // 状态 / 计数 / 任务行
-  self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 48, w - 24, 18)];
-  self.statusLabel.font = [UIFont systemFontOfSize:12];
-  self.counterLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 68, w - 24, 18)];
-  self.counterLabel.font = [UIFont boldSystemFontOfSize:12];
+  // 状态 / 大号计数 / 任务行（成单字要大）
+  self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 48, w - 24, 20)];
+  self.statusLabel.font = [UIFont boldSystemFontOfSize:14];
+  self.counterLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 70, w - 24, 30)];
+  self.counterLabel.font = [UIFont boldSystemFontOfSize:24];
   self.counterLabel.textColor = AhaColor(120, 200, 255, 1);
-  self.taskLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 88, w - 24, 18)];
+  self.taskLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 102, w - 24, 16)];
   self.taskLabel.font = [UIFont systemFontOfSize:11];
   self.taskLabel.textColor = AhaColor(255, 255, 255, 0.55);
   [p addSubview:self.statusLabel];
   [p addSubview:self.counterLabel];
   [p addSubview:self.taskLabel];
 
-  // 账号 + 间隔输入
-  self.userField = AhaField(@"租用账号（中枢后台开的）", @"👤");
-  self.gapField  = AhaField(@"间隔秒，如 8-20", @"⏱");
+  // 账号（敞口：无密码）+ 间隔/休息
+  self.userField = AhaField(@"账号（中枢后台账号）", @"👤");
+  self.gapField        = AhaField(@"间隔秒 0-0", @"⏱");
+  self.restEveryField  = AhaField(@"每N单休", @"☕");
+  self.restSecField    = AhaField(@"休秒", @"⏸");
   self.gapField.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+  self.restEveryField.keyboardType = UIKeyboardTypeNumberPad;
+  self.restSecField.keyboardType = UIKeyboardTypeNumberPad;
   [p addSubview:self.userField];
   [p addSubview:self.gapField];
+  [p addSubview:self.restEveryField];
+  [p addSubview:self.restSecField];
 
-  // 按钮行
-  self.loginBtn = AhaBtn(@"登录", AhaColor(35, 100, 235, 1), 13);
-  self.startBtn = AhaBtn(@"开始", AhaColor(34, 160, 84, 1), 13);
-  self.stopBtn  = AhaBtn(@"停止", AhaColor(200, 60, 56, 1), 13);
-  self.resetBtn = AhaBtn(@"清零", AhaColor(90, 96, 108, 1), 13);
-  for (UIButton *b in @[self.loginBtn, self.startBtn, self.stopBtn, self.resetBtn]) [p addSubview:b];
+  // 一个大按钮 = 开始（自动登录）/ 停止，同一按钮；旁边小清零
+  self.startBtn = AhaBtn(@"▶ 开始采集", AhaColor(34, 170, 90, 1), 18);
+  self.startBtn.layer.cornerRadius = 10;
+  self.resetBtn = AhaBtn(@"清零", AhaColor(90, 96, 108, 1), 14);
+  self.resetBtn.layer.cornerRadius = 10;
+  [p addSubview:self.startBtn];
+  [p addSubview:self.resetBtn];
 
   // 日志窗
   self.logView = [[UITextView alloc] initWithFrame:CGRectZero];
@@ -748,17 +778,20 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   // 交互
   ahaTap(self.gearBtn,  ^{ [[AHAUI shared] showSettings]; });
   ahaTap(self.miniBtn,  ^{ [[AHAUI shared] collapse:YES]; });
-  ahaTap(self.loginBtn, ^{ [gPool connect:nil]; });
-  ahaTap(self.startBtn, ^{ [gPool startLoop]; });
-  ahaTap(self.stopBtn,  ^{ [gPool stopLoop]; });
+  ahaTap(self.startBtn, ^{
+    if (gPool.running) [gPool stopLoop];
+    else [gPool startLoop];          // 未登录会自动先登录再开始
+  });
   ahaTap(self.resetBtn, ^{ [gPool resetCounters]; ahaLog(@"i", @"计数已清零"); });
 
-  // 输入框预填 + 失焦保存
+  // 输入框预填（间隔默认 0-0）+ 失焦保存
   self.userField.text = gPool.cfg[@"user"] ?: @"";
-  NSInteger lo = [gPool num:@"gapMin" def:8], hi = [gPool num:@"gapMax" def:20];
+  NSInteger lo = [gPool num:@"gapMin" def:0], hi = [gPool num:@"gapMax" def:0];
   self.gapField.text = [NSString stringWithFormat:@"%ld-%ld", (long)lo, (long)hi];
-  [self.userField addTarget:self action:@selector(fieldsChanged) forControlEvents:UIControlEventEditingDidEnd];
-  [self.gapField addTarget:self action:@selector(fieldsChanged) forControlEvents:UIControlEventEditingDidEnd];
+  self.restEveryField.text = [NSString stringWithFormat:@"%ld", (long)[gPool num:@"restEvery" def:0]];
+  self.restSecField.text   = [NSString stringWithFormat:@"%ld", (long)[gPool num:@"restSec" def:60]];
+  for (UITextField *f in @[self.userField, self.gapField, self.restEveryField, self.restSecField])
+    [f addTarget:self action:@selector(fieldsChanged) forControlEvents:UIControlEventEditingDidEnd];
 
   [self layoutPanel];
   [self refresh];
@@ -776,48 +809,31 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   gPool.cfg[@"user"] = self.userField.text ?: @"";
   NSString *s = [self.gapField.text stringByReplacingOccurrencesOfString:@" " withString:@""];
   NSArray *parts = [s componentsSeparatedByString:@"-"];
-  NSInteger lo = [parts.firstObject integerValue];
-  NSInteger hi = parts.count > 1 ? [parts[1] integerValue] : 0;
-  if (lo > 0) gPool.cfg[@"gapMin"] = @(lo);
-  if (hi >= lo && hi > 0) gPool.cfg[@"gapMax"] = @(hi);
+  NSInteger lo = MAX([parts.firstObject integerValue], 0);
+  NSInteger hi = parts.count > 1 ? MAX([parts[1] integerValue], 0) : lo;
+  if (hi < lo) hi = lo;
+  gPool.cfg[@"gapMin"] = @(lo);
+  gPool.cfg[@"gapMax"] = @(hi);
+  gPool.cfg[@"restEvery"] = @(MAX([self.restEveryField.text integerValue], 0));
+  gPool.cfg[@"restSec"]   = @(MAX([self.restSecField.text integerValue], 0));
   [gPool saveCfg];
   ahaLog(@"i", @"配置已保存（本机）");
 }
 
 - (void)showSettings {
-  UIAlertController *a = [UIAlertController alertControllerWithTitle:@"AHA 设置"
+  UIAlertController *a = [UIAlertController alertControllerWithTitle:@"服务器地址"
       message:nil preferredStyle:UIAlertControllerStyleAlert];
   [a addTextFieldWithConfigurationHandler:^(UITextField *f) {
-    f.placeholder = @"服务器地址";
+    f.placeholder = @"https://140.235.98.220:29690";
     f.text = gPool.cfg[@"server"] ?: @"";
-  }];
-  [a addTextFieldWithConfigurationHandler:^(UITextField *f) {
-    f.placeholder = @"密码";
-    f.secureTextEntry = YES;
-    f.text = gPool.cfg[@"pass"] ?: @"";
-  }];
-  [a addTextFieldWithConfigurationHandler:^(UITextField *f) {
-    f.placeholder = @"休息：每 N 单（0=不歇）";
-    f.keyboardType = UIKeyboardTypeNumberPad;
-    f.text = [NSString stringWithFormat:@"%ld",
-        (long)(gPool.cfg[@"restEvery"] ? [gPool.cfg[@"restEvery"] integerValue] : 0)];
-  }];
-  [a addTextFieldWithConfigurationHandler:^(UITextField *f) {
-    f.placeholder = @"休息秒数";
-    f.keyboardType = UIKeyboardTypeNumberPad;
-    f.text = [NSString stringWithFormat:@"%ld",
-        (long)(gPool.cfg[@"restSec"] ? [gPool.cfg[@"restSec"] integerValue] : 60)];
   }];
   [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *act) {
     NSString *sv = a.textFields[0].text ?: @"";
-    if (sv.length) gPool.cfg[@"server"] = sv;
-    gPool.cfg[@"pass"] = a.textFields[1].text ?: @"";
-    NSInteger ev = [a.textFields[2].text integerValue];
-    NSInteger rs = [a.textFields[3].text integerValue];
-    gPool.cfg[@"restEvery"] = @(MAX(ev, 0));
-    gPool.cfg[@"restSec"] = @(rs > 0 ? rs : 60);
-    [gPool saveCfg];
-    ahaLog(@"i", @"设置已保存");
+    if (sv.length) {
+      gPool.cfg[@"server"] = sv;
+      [gPool saveCfg];
+      ahaLog(@"i", @"服务器已保存");
+    }
   }]];
   [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
   UIViewController *top = self.win.rootViewController;
@@ -851,18 +867,17 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   self.ttl.frame = CGRectMake(12, 0, w - 90, 40);
   self.gearBtn.frame = CGRectMake(w - 72, 4, 32, 32);
   self.miniBtn.frame = CGRectMake(w - 40, 4, 36, 32);
-  self.statusLabel.frame  = CGRectMake(12, 48, w - 24, 18);
-  self.counterLabel.frame = CGRectMake(12, 68, w - 24, 18);
-  self.taskLabel.frame    = CGRectMake(12, 88, w - 24, 18);
-  CGFloat fw = (w - 12 * 2 - 8) / 2;
-  self.userField.frame = CGRectMake(12, 112, fw, 34);
-  self.gapField.frame  = CGRectMake(12 + fw + 8, 112, fw, 34);
-  CGFloat bw = (w - 12 * 2 - 3 * 6) / 4;
-  self.loginBtn.frame = CGRectMake(12,               152, bw, 30);
-  self.startBtn.frame = CGRectMake(12 + (bw + 6),    152, bw, 30);
-  self.stopBtn.frame  = CGRectMake(12 + (bw + 6) * 2, 152, bw, 30);
-  self.resetBtn.frame = CGRectMake(12 + (bw + 6) * 3, 152, bw, 30);
-  self.logView.frame  = CGRectMake(12, 188, w - 24, h - 188 - 14);
+  self.statusLabel.frame  = CGRectMake(12, 48, w - 24, 20);
+  self.counterLabel.frame = CGRectMake(12, 70, w - 24, 30);
+  self.taskLabel.frame    = CGRectMake(12, 102, w - 24, 16);
+  self.userField.frame = CGRectMake(12, 122, w - 24, 34);
+  CGFloat fw = (w - 12 * 2 - 2 * 6) / 3;
+  self.gapField.frame       = CGRectMake(12,          162, fw, 32);
+  self.restEveryField.frame = CGRectMake(12 + fw + 6,  162, fw, 32);
+  self.restSecField.frame   = CGRectMake(12 + (fw + 6) * 2, 162, fw, 32);
+  self.startBtn.frame = CGRectMake(12, 200, w - 12 * 2 - 52 - 8, 46);
+  self.resetBtn.frame = CGRectMake(w - 12 - 52, 200, 52, 46);
+  self.logView.frame  = CGRectMake(12, 254, w - 24, h - 254 - 14);
   self.rh.frame       = CGRectMake(w - 20, h - 20, 20, 20);
 }
 
@@ -874,6 +889,14 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
       : (gPool.connected ? AhaColor(120, 200, 255, 1) : AhaColor(255, 255, 255, 0.4)));
   self.counterLabel.text = gPool.counterText;
   self.taskLabel.text = gPool.taskText;
+  // 大按钮 = 开始/停止 同一按钮
+  if (gPool.running) {
+    [self.startBtn setTitle:@"■ 停止采集" forState:UIControlStateNormal];
+    self.startBtn.backgroundColor = AhaColor(200, 60, 56, 1);
+  } else {
+    [self.startBtn setTitle:@"▶ 开始采集" forState:UIControlStateNormal];
+    self.startBtn.backgroundColor = AhaColor(34, 170, 90, 1);
+  }
   self.miniInfo.text = [NSString stringWithFormat:@"%ld/%ld", (long)gPool.taken, (long)gPool.ok];
   NSArray *lines = gPool.logLines;
   if (lines.count) {
@@ -913,8 +936,8 @@ static void ahaRefreshUI(void) {
     CGPoint t = [g translationInView:self];
     CGFloat scrW = [UIScreen mainScreen].bounds.size.width;
     CGFloat scrH = [UIScreen mainScreen].bounds.size.height;
-    CGFloat w = MIN(MAX(w0 + t.x, 260), scrW - 20);
-    CGFloat h = MIN(MAX(h0 + t.y, 300), scrH - 40);
+    CGFloat w = MIN(MAX(w0 + t.x, 280), scrW - 20);
+    CGFloat h = MIN(MAX(h0 + t.y, 330), scrH - 40);
     self.frame = CGRectMake(self.frame.origin.x, self.frame.origin.y, w, h);
     if (gUI) [gUI layoutPanel];
   }
