@@ -728,8 +728,9 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
       id pig = [requestLike objectForKeyedSubscript:kAhaBufKey];
       if ([pig isKindOfClass:[NSData class]]) {
         bufData = [NSData dataWithData:pig];
-        if ([requestLike respondsToSelector:@selector(removeObjectForKeyedSubscript:)])
-          [(NSMutableDictionary *)requestLike removeObjectForKeyedSubscript:kAhaBufKey]; // 取完即清，防重复投递
+        SEL selRemove = NSSelectorFromString(@"removeObjectForKeyedSubscript:");
+        if ([requestLike respondsToSelector:selRemove])
+          ((void (*)(id, SEL, id))objc_msgSend)(requestLike, selRemove, kAhaBufKey); // 取完即清，防重复投递
       }
     }
     if (!bufData && isTask) {
