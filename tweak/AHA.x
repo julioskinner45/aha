@@ -134,7 +134,7 @@ static NSString *AhaJsonStr(NSString *s);
     [[AHACapture shared] storeBody:body forURL:self.request.URL];
   }
   if (err) [self.client URLProtocol:self didFailWithError:err];
-  else [self.client URLProtocol:self didFinishLoading];
+  else [self.client URLProtocolDidFinishLoading:self];
 }
 
 @end
