@@ -500,7 +500,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
   }
   __block NSString *out = nil;
   dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-  [[[AhaSession([NSURLSessionConfiguration ephemeralSessionConfiguration])]
+  [[AhaSession([NSURLSessionConfiguration ephemeralSessionConfiguration])
    dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
     if (!e && d) {
       NSHTTPURLResponse *hr = [r isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)r : nil;
