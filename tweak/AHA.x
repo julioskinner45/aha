@@ -1267,11 +1267,14 @@ static void ahaRefreshUI(void) {
 // SIGABRT/SIGBUS/SIGILL/SIGTRAP）走 signal 处理器记信号类型。
 static void ahaCrashRecord(NSString *tag, NSString *detail) {
   @try {
+    static NSDateFormatter *df; static dispatch_once_t dOnce;
+    dispatch_once(&dOnce, ^{
+      df = [[NSDateFormatter alloc] init];
+      df.dateFormat = @"MM-dd HH:mm:ss";
+    });
     NSString *prev = [[NSUserDefaults standardUserDefaults] stringForKey:kAhaCrashKey];
-    NSString *line = [NSString stringWithFormat:@"%@ %@（上次）",
-        [NSDateFormatter localizedStringFromDate:[NSDate date]
-                                      dateFormatterStyle:NSDateFormatterShortStyle
-                                      timeFormatterStyle:NSDateFormatterMediumStyle], detail ?: tag];
+    NSString *line = [NSString stringWithFormat:@"%@ %@",
+        [df stringFromDate:[NSDate date]], detail ?: tag];
     // 只留最近 3 条，防无限膨胀
     NSMutableArray *arr = [prev ? [prev componentsSeparatedByString:@"\n----------\n"] : @[]
                             mutableCopy];
