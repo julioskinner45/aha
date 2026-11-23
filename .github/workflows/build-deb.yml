@@ -1,9 +1,7 @@
 name: Build AHA .deb
 
-# 无需苹果电脑：GitHub 提供的 macOS runner 自带正版 Xcode / iPhoneOS SDK。
-# 公开仓库免费；push 即自动构建，也可在 Actions 页面手动点 "Run workflow"。
-# 构建产物 = 最终可直接安装的 .deb（真功能 AHA.dylib 版），在本次运行的
-# Artifacts 区下载 AHA-deb.zip，解压即得。
+# 新账号 GitHub 会自动取消 macOS runner 的任务（反滥用），但 Ubuntu 不限制。
+# Theos 官方支持 Linux 交叉编译 iOS tweak，本工作流在 ubuntu-latest 上出最终 .deb。
 
 on:
   workflow_dispatch:
@@ -12,28 +10,18 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
-    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ldid (Theos signing)
-        run: brew install ldid
-
-      - name: Install Theos (含 sdks 子模块)
+      - name: Install Theos (Linux toolchain + sdks + ldid)
         run: |
-          git clone --depth 1 --recursive https://github.com/theos/theos.git "$HOME/theos"
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
           echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
-
-      - name: Link Xcode iPhoneOS SDK into Theos
-        run: |
-          mkdir -p "$THEOS/sdks"
-          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          VER="$(xcrun --sdk iphoneos --show-sdk-version)"
-          ln -sfn "$SDK" "$THEOS/sdks/iPhoneOS${VER}.sdk"
-          echo "SDK = $SDK   version = $VER"
+          ls "$HOME/theos" | head -20
 
       - name: Build AHA.dylib (rootless / arm64)
         working-directory: tweak
@@ -46,7 +34,7 @@ jobs:
           echo "DYLIB_PATH=$DYLIB" >> "$GITHUB_ENV"
           file "$DYLIB"
 
-      - name: Pack final .deb (真功能版)
+      - name: Pack final .deb
         run: |
           python3 make_deb.py --dylib "$DYLIB_PATH"
           DEB="$(ls out/aha_*.deb | head -1)"
