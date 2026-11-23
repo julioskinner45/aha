@@ -581,6 +581,11 @@ static void ahaLog(NSString *lv, NSString *msg) {
   self.taskLine = @"";
   ahaLog(@"s", [NSString stringWithFormat:@"单子 %@ 已交（%@），累计成功 %ld", taskId, via, (long)self.ok]);
   ahaRefreshUI();
+  // 聚星直传成功必须回执中枢记账（status=ok → 任务置 done + submitted+1）；
+  // 中枢代交路径由 /api/pool/submit 自己记账，互斥不重复计
+  if ([via isEqualToString:@"聚星直传"])
+    [self api:@"/api/pool/report" method:@"POST"
+        body:@{ @"taskId": taskId, @"profileId": self.cfg[@"pid"] ?: @"", @"status": @"ok" } done:nil];
   [self scheduleNext:[self randomGap]];
 }
 
