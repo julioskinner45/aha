@@ -513,7 +513,11 @@ static void ahaLog(NSString *lv, NSString *msg) {
 - (double)randomGap {
   double lo = [self num:@"gapMin" def:0], hi = [self num:@"gapMax" def:0];
   if (hi < lo) hi = lo;
-  return lo + arc4random_uniform((UInt32)(hi - lo + 1));
+  double g = lo + arc4random_uniform((UInt32)(hi - lo + 1));
+  // 风控自动冷却（比 Ajie 多的一层）：命中风控墙后本轮间隔×3 且至少 45 秒，
+  // 不硬暂停 —— 下次成功截到正常包 risk 自动清零，恢复原节奏
+  if (self.risk) g = MAX(45.0, g * 3);
+  return g;
 }
 - (void)scheduleNext:(double)afterSec {
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(afterSec * NSEC_PER_SEC)),
