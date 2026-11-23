@@ -50,7 +50,7 @@ jobs:
           make FINALPACKAGE=1 ARCHS=arm64
           DYLIB="$(find . -name 'AHA.dylib' -not -path '*packages*' | head -1)"
           test -n "$DYLIB" || { echo "AHA.dylib 没找到"; exit 1; }
-          echo "DYLIB_PATH=$DYLIB" >> "$GITHUB_ENV"
+          echo "DYLIB_PATH=$(realpath "$DYLIB")" >> "$GITHUB_ENV"
           file "$DYLIB"
 
       - name: Pack final .deb
