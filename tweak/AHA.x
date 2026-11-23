@@ -47,6 +47,7 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
 
 @interface AHAPool : NSObject
 @property(nonatomic, strong) NSMutableDictionary *cfg;
+@property(nonatomic, strong) NSDate *lastRiskAlert;
 @property(nonatomic, assign) BOOL running, connected, resting, risk;
 @property(nonatomic, assign) NSInteger taken, ok;
 @property(nonatomic, copy) NSString *me, *token, *taskLine;
@@ -55,6 +56,7 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
 - (void)startLoop;
 - (void)stopLoop;
 - (void)helloTick;
+- (void)riskHit;
 - (void)saveCfg;
 - (NSInteger)num:(NSString *)k def:(NSInteger)d;
 - (NSString *)statusText;
@@ -115,15 +117,15 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
   NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
   if (!body.length) return;
 
-  // —— 风控识别（Ajie 同款判据）——
+  // —— 风控识别（Ajie 同款判据 + 弹窗提醒）——
   if (code == 403 || [body containsString:@"90309999"]) {
     ahaLog(@"e", @"⛔ 命中风控墙（HTTP 403 / 90309999）——建议暂停歇会");
-    if (gPool) { dispatch_async(gPool.q, ^{ gPool.risk = YES; }); ahaRefreshUI(); }
+    if (gPool) { dispatch_async(gPool.q, ^{ [gPool riskHit]; }); ahaRefreshUI(); }
     return;
   }
   if ([body containsString:@"266900002"]) {
     ahaLog(@"w", @"⚠️ get_pc 报 266900002（风控前置信号）");
-    if (gPool) { dispatch_async(gPool.q, ^{ gPool.risk = YES; }); ahaRefreshUI(); }
+    if (gPool) { dispatch_async(gPool.q, ^{ [gPool riskHit]; }); ahaRefreshUI(); }
     return;
   }
   if (code != 200) {
@@ -429,6 +431,32 @@ static void ahaLog(NSString *lv, NSString *msg) {
   if (gPool) [gPool appendLog:(lv ?: @"i") msg:(msg ?: @"")];
 }
 
+// —— 风控提醒（Ajie 同款弹窗）：状态沿触发 + 5 分钟节流，弹在我们自己的悬浮窗上 ——
+static void ahaRiskAlertShow(void) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    UIWindow *w = ahaOwnWin();
+    if (!w || !w.rootViewController) return;
+    UIViewController *top = w.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"⚠️ 风控提醒"
+        message:@"命中虾皮风控墙（HTTP 403 / 90309999 / get_pc 266900002）。\n建议点「■ 停止采集」歇几分钟再继续，频繁硬闯会加重。"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+    [top presentViewController:a animated:YES completion:nil];
+  });
+}
+
+- (void)riskHit {
+  BOOL edge = !self.risk;                       // 未风控 → 风控 的跳变才弹
+  NSDate *last = self.lastRiskAlert;
+  BOOL throttled = (!edge && last && [last timeIntervalSinceNow] > -300);  // 持续风控期 5 分钟提醒一次
+  self.risk = YES;
+  if (edge || !throttled) {
+    self.lastRiskAlert = [NSDate date];
+    ahaRiskAlertShow();
+  }
+}
+
 // —— HTTP（默认会话；pdp 请求顺带被钩子记住上下文，喂给 Direct PDP）——
 - (void)api:(NSString *)path method:(NSString *)method body:(NSDictionary *)body
         done:(void (^)(NSDictionary *, NSError *))done {
@@ -513,11 +541,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
 - (double)randomGap {
   double lo = [self num:@"gapMin" def:0], hi = [self num:@"gapMax" def:0];
   if (hi < lo) hi = lo;
-  double g = lo + arc4random_uniform((UInt32)(hi - lo + 1));
-  // 风控自动冷却（比 Ajie 多的一层）：命中风控墙后本轮间隔×3 且至少 45 秒，
-  // 不硬暂停 —— 下次成功截到正常包 risk 自动清零，恢复原节奏
-  if (self.risk) g = MAX(45.0, g * 3);
-  return g;
+  return lo + arc4random_uniform((UInt32)(hi - lo + 1));
 }
 - (void)scheduleNext:(double)afterSec {
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(afterSec * NSEC_PER_SEC)),
