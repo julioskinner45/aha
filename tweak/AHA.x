@@ -1,4 +1,15 @@
-// AHA.x — Shopee app 内采集客户端 v0.5.0（App 内路由导航 + 键盘完成条 + 休息折叠）
+// AHA.x — Shopee app 内采集客户端 v0.5.6（导航 = Ajie 逐字复刻 + 面包屑诊断）
+//
+// v0.5.6 关键改动（对照 Ajie 0.1.3 反汇编逐条对齐）：
+//   1. 导航管理器解析：BTAppManager/BTApplicationAddonProvider/SHPNavigator 三类候选
+//      → 单例 getter（sharedInstance/sharedManager/defaultManager/manager/shared）
+//      → 属性钻取（appManager/navigationManager/navigator/router/pageNavigator…），
+//      验收标准 = 对象响应 navigateFromViewController:…/pushFromViewController:…
+//   2. 参数传递：NSInvocation 签名驱动 + NSNull 转 NULL（Ajie 同款），不再裸 msgSend 猜参
+//   3. route 字符串 4 种格式轮试（item_id/shop_id、good_id/shop_id、shopid/itemid、PRODUCT_PAGE）
+//   4. 回根后再跳：pop 完等 0.4 秒（Ajie 0.35s 同款），不跟回根动画打架
+//   5. 诊断：关键步骤写「面包屑」到 NSUserDefaults，闪退后下次启动面板直接报最后一步；
+//      崩溃 handler 延迟 6 秒重装（覆盖 Shopee 自己装的 handler，否则永远拿不到日志）
 //
 // 采集方式（Ajie 同款，不再用 NSURLProtocol——后台会话挂自定义协议会直接崩）：
 //   hook -[NSURLSession dataTaskWithRequest:completionHandler:] 与
@@ -199,7 +210,15 @@ static NSURLSession *AhaSession(NSURLSessionConfiguration *cfg) {
   return [NSURLSession sessionWithConfiguration:cfg delegate:td delegateQueue:nil];
 }
 
-#pragma mark - App 内路由导航（Ajie 实证做法：Shopee 自带 SHPNavigator，绝不跳出 app）
+#pragma mark - App 内路由导航（v0.5.6 = Ajie 反汇编逐字复刻，绝不跳出 app）
+
+// —— 面包屑：每个关键步骤先把名字写进 NSUserDefaults，闪退后下次启动就能报「死在哪一步」——
+static void ahaStep(NSString *tag) {
+  @try {
+    [[NSUserDefaults standardUserDefaults] setObject:tag forKey:@"aha_step_v1"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+  } @catch (__unused NSException *e) { /* 记录失败就算了 */ }
+}
 
 // 拿我们自己的悬浮窗（AHAUI 在后面才实现，属性走运行时取）
 static UIWindow *ahaOwnWin(void) {
@@ -209,28 +228,7 @@ static UIWindow *ahaOwnWin(void) {
   return ((id(*)(id, SEL))objc_msgSend)((id)gUI, s);
 }
 
-// 找 Shopee 自己窗口的当前 VC（跳过我们的悬浮窗）
-static UIViewController *ahaTopVC(void) {
-  UIViewController *fallback = nil;
-  UIWindow *own = ahaOwnWin();
-  for (UIWindow *w in [UIApplication sharedApplication].windows) {
-    if (w == own) continue;
-    UIViewController *vc = w.rootViewController;
-    if (!vc) continue;
-    if (!fallback) fallback = vc;
-    if (w.isKeyWindow) {
-      while (vc.presentedViewController) vc = vc.presentedViewController;
-      if ([vc isKindOfClass:[UINavigationController class]]) {
-        UIViewController *t = [(UINavigationController *)vc topViewController];
-        if (t) vc = t;
-      }
-      return vc;
-    }
-  }
-  return fallback;
-}
-
-// 找 Shopee 自己的导航控制器（收弹层/控栈深用）
+// Shopee 自己的导航控制器（回根用）
 static UINavigationController *ahaShopeeNav(void) {
   UIWindow *own = ahaOwnWin();
   for (UIWindow *w in [UIApplication sharedApplication].windows) {
@@ -245,99 +243,180 @@ static UINavigationController *ahaShopeeNav(void) {
   return nil;
 }
 
-// navigateOption/pushOption/completion 三个参数只敢传对象或标量（按 0/nil），结构体参数直接放弃该选择器
-static BOOL ahaArgTypeOk(NSMethodSignature *sig, NSUInteger idx) {
-  if (sig.numberOfArguments <= idx) return NO;
-  const char *t = [sig getArgumentTypeAtIndex:idx];
-  if (!t || !t[0]) return NO;
-  switch (t[0]) {
-    case '@': case 'q': case 'Q': case 'i': case 'I': case 'l': case 'L':
-    case 's': case 'S': case 'c': case 'C': case 'Z': case 'B':
-      return YES;
-    default:
-      return NO;
+// —— NSInvocation 安全调用器（Ajie invokeSelector:onTarget:arguments: 逐字复刻）：
+// 签名驱动、NSNull 转 NULL、标量按类型宽度取值、结构体一律拒绝。
+// 不再裸 objc_msgSend 猜参数（v0.5.2/v0.5.4/v0.5.5 三连崩的主嫌）——
+static BOOL ahaInvoke(id target, SEL sel, NSArray *args, NSString *tag) {
+  if (!target || !sel) return NO;
+  @try {
+    NSMethodSignature *sig = [target methodSignatureForSelector:sel];
+    if (!sig || sig.numberOfArguments < 2) return NO;
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:target];
+    [inv setSelector:sel];
+    NSUInteger n = MIN(sig.numberOfArguments - 2, args.count);
+    for (NSUInteger i = 0; i < n; i++) {
+      const char *t = [sig getArgumentTypeAtIndex:i + 2];
+      if (!t || !t[0]) return NO;
+      id a = [args objectAtIndex:i];
+      NSUInteger at = i + 2;
+      switch (t[0]) {
+        case '@': {
+          id v = ([a isKindOfClass:[NSNull class]]) ? nil : a;    // NSNull → NULL（Ajie 同款）
+          [inv setArgument:&v atIndex:at];
+          break;
+        }
+        case 'q': case 'l': { long long v = [a respondsToSelector:@selector(longLongValue)] ? [a longLongValue] : 0; [inv setArgument:&v atIndex:at]; break; }
+        case 'Q': case 'L': { unsigned long long v = [a respondsToSelector:@selector(unsignedLongLongValue)] ? [a unsignedLongLongValue] : 0; [inv setArgument:&v atIndex:at]; break; }
+        case 'i': { int v = (int)[a respondsToSelector:@selector(intValue)] ? [a intValue] : 0; [inv setArgument:&v atIndex:at]; break; }
+        case 'I': { unsigned int v = (unsigned int)[a respondsToSelector:@selector(unsignedIntValue)] ? [a unsignedIntValue] : 0; [inv setArgument:&v atIndex:at]; break; }
+        case 's': { short v = (short)[a respondsToSelector:@selector(shortValue)] ? [a shortValue] : 0; [inv setArgument:&v atIndex:at]; break; }
+        case 'S': { unsigned short v = (unsigned short)[a respondsToSelector:@selector(unsignedShortValue)] ? [a unsignedShortValue] : 0; [inv setArgument:&v atIndex:at]; break; }
+        case 'c': { char v = (char)[a respondsToSelector:@selector(charValue)] ? [a charValue] : 0; [inv setArgument:&v atIndex:at]; break; }
+        case 'C': { unsigned char v = (unsigned char)[a respondsToSelector:@selector(unsignedCharValue)] ? [a unsignedCharValue] : 0; [inv setArgument:&v atIndex:at]; break; }
+        case 'B': case 'Z': { BOOL v = [a respondsToSelector:@selector(boolValue)] ? [a boolValue] : NO; [inv setArgument:&v atIndex:at]; break; }
+        case 'd': { double v = [a respondsToSelector:@selector(doubleValue)] ? [a doubleValue] : 0; [inv setArgument:&v atIndex:at]; break; }
+        case 'f': { float v = (float)[a respondsToSelector:@selector(floatValue)] ? [a floatValue] : 0; [inv setArgument:&v atIndex:at]; break; }
+        default:
+          ahaLog(@"w", [NSString stringWithFormat:@"内路由[%@]：第 %lu 个参数类型 '%c' 不支持，放弃", tag, (unsigned long)i + 1, t[0]]);
+          return NO;   // 结构体/未知类型绝不硬调
+      }
+    }
+    [inv invoke];
+    return YES;
+  } @catch (NSException *e) {
+    ahaLog(@"w", [NSString stringWithFormat:@"内路由[%@]调用异常：%@", tag, e.reason]);
+    return NO;
   }
 }
 
-// Ajie 的路由链（从它 dylib 里挖的候选）：SHPNavigator 单例 + SHPNavigatorNavigationPath
-// 路径串 rn/PRODUCT_PAGE?item_id=X&shop_id=Y —— Shopee 内部 RN 页面路由，页面在 app 里 push
-//
-// 闪退防线（v0.5.2 实测踩坑）：
-//   1. 路径对象只许用类工厂方法造（pathWithString: 等），绝不 alloc/init 猜初始化器 ——
-//      内部 ivar 没填全的对象传进 Shopee 导航器会 EXC_BAD_ACCESS，@try 挡不住
-//   2. 只调探测通过的选择器：签名参数个数必须严丝合缝、参数类型必须是对象；
-//      navigateOption/pushOption 传 nil（0）不安全的一律跳过
-//   3. 任何一步不确定 → 立即放弃 app 内路由，走网页兜底（宁可慢，不可崩）
-static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
-  Class navCls  = NSClassFromString(@"SHPNavigator");
+// —— 管理器解析（Ajie resolvedNavigationManager 复刻）：
+// 类候选 → 单例 getter → 属性钻取，验收 = 对象响应导航方法 ——
+static BOOL ahaRespondsNav(id obj) {
+  if (!obj) return NO;
+  SEL a = NSSelectorFromString(@"navigateFromViewController:destinationPath:navigateOption:completion:");
+  SEL b = NSSelectorFromString(@"pushFromViewController:destinationPath:pushOption:completion:");
+  return [obj respondsToSelector:a] || [obj respondsToSelector:b];
+}
+
+static id ahaMsgObj0(id obj, SEL s) {
+  NSMethodSignature *sig = [obj methodSignatureForSelector:s];
+  if (!sig || sig.numberOfArguments != 2) return nil;           // 只碰无参 getter
+  if ([sig methodReturnType][0] != '@') return nil;             // 返回必须是对象
+  return ((id(*)(id, SEL))objc_msgSend)(obj, s);
+}
+
+static id ahaResolveManager(void) {
+  NSArray *clsNames = @[@"BTAppManager", @"BTApplicationAddonProvider", @"SHPNavigator"];
+  NSArray *singles  = @[@"sharedInstance", @"sharedManager", @"defaultManager", @"manager", @"shared"];
+  NSArray *drills   = @[@"appManager", @"navigationManager", @"navigator", @"defaultManager",
+                        @"manager", @"navigatorManager", @"pageNavigator", @"router"];
+  for (NSString *cn in clsNames) {
+    Class c = NSClassFromString(cn);
+    if (!c) continue;
+    id base = nil;
+    for (NSString *g in singles) {
+      SEL s = NSSelectorFromString(g);
+      if (![c respondsToSelector:s]) continue;
+      id o = nil;
+      @try { o = ((id(*)(id, SEL))objc_msgSend)(c, s); } @catch (__unused NSException *e) { continue; }
+      if (o) { base = o; break; }
+    }
+    if (!base) continue;
+    if (ahaRespondsNav(base)) return base;
+    for (NSString *g in drills) {
+      SEL s = NSSelectorFromString(g);
+      if (![base respondsToSelector:s]) continue;
+      id o = nil;
+      @try { o = ahaMsgObj0(base, s); } @catch (__unused NSException *e) { continue; }
+      if (ahaRespondsNav(o)) return o;
+    }
+  }
+  return nil;
+}
+
+// —— 顶层 VC（Ajie topViewController 同思路）：主窗口 → root → 弹层/标签/导航栈逐层解 ——
+static UIViewController *ahaResolvedTopVC(void) {
+  UIWindow *own = ahaOwnWin();
+  UIWindow *main = nil;
+  for (UIWindow *w in [UIApplication sharedApplication].windows) {
+    if (w == own || !w.rootViewController) continue;
+    if (!main || w.isKeyWindow) main = w;
+    if (w.isKeyWindow) break;
+  }
+  if (!main) return nil;
+  UIViewController *vc = main.rootViewController;
+  if (!vc) return nil;
+  while (vc.presentedViewController) vc = vc.presentedViewController;
+  if ([vc isKindOfClass:[UITabBarController class]])
+    vc = [(UITabBarController *)vc selectedViewController] ?: vc;
+  if ([vc isKindOfClass:[UINavigationController class]])
+    vc = [(UINavigationController *)vc topViewController] ?: vc;
+  while (vc.presentedViewController) vc = vc.presentedViewController;
+  return vc;
+}
+
+// —— 路径对象（Ajie buildNavigationPathObjectForRoute: 复刻，v0.5.5 已对齐）——
+static id ahaBuildPath(NSString *route) {
   Class pathCls = NSClassFromString(@"SHPNavigatorNavigationPath");
-  if (!navCls || !pathCls) return NO;
-  @try {
-    id nav = nil;
-    for (NSString *m in @[@"sharedInstance", @"sharedManager", @"defaultManager", @"manager",
-                          @"shared", @"navigator", @"navigationManager", @"navigatorManager"]) {
-      SEL s = NSSelectorFromString(m);
-      if ([navCls respondsToSelector:s]) {
-        nav = ((id(*)(id, SEL))objc_msgSend)(navCls, s);
-        if (nav) break;
-      }
-    }
-    if (!nav) return NO;
-
-    NSString *route = [NSString stringWithFormat:@"rn/PRODUCT_PAGE?item_id=%@&shop_id=%@", itemId, shopId];
-    // 候选清单与顺序照抄 Ajie 实证（它 dylib 里的路径工厂候选就是这个序）：
-    //   AppRL 系列（Shopee 正牌 App Route Link API）→ String → Route → alloc/init 兜底
-    id path = nil;
-    id (*msgObj)(id, SEL, id) = (id(*)(id, SEL, id))objc_msgSend;
-    for (NSString *m in @[@"pathWithAppRL:", @"navigationPathWithAppRL:",
-                          @"pathWithString:", @"navigationPathWithString:", @"pathWithRoute:"]) {
-      SEL s = NSSelectorFromString(m);
-      if ([pathCls respondsToSelector:s]) {
-        id p = msgObj(pathCls, s, route);
-        if (p && [p isKindOfClass:pathCls]) { path = p; break; }   // 对象必须经类校验
-      }
-    }
-    if (!path) {
-      // Ajie 同款兜底：alloc + initWithAppRL:/initWithString:/initWithRoute:（正规初始化器，非瞎猜）
+  if (!pathCls || route.length == 0) return nil;
+  id (*msgObj)(id, SEL, id) = (id(*)(id, SEL, id))objc_msgSend;
+  for (NSString *m in @[@"pathWithAppRL:", @"navigationPathWithAppRL:",
+                        @"pathWithString:", @"navigationPathWithString:", @"pathWithRoute:"]) {
+    SEL s = NSSelectorFromString(m);
+    if ([pathCls respondsToSelector:s]) {
       @try {
-        id p = [[pathCls alloc] init];
-        for (NSString *m in @[@"initWithAppRL:", @"initWithString:", @"initWithRoute:"]) {
-          SEL s = NSSelectorFromString(m);
-          if ([p respondsToSelector:s]) { id q = msgObj(p, s, route); if ([q isKindOfClass:pathCls]) { path = q; break; } }
-        }
-      } @catch (__unused NSException *e) { path = nil; }
+        id p = msgObj(pathCls, s, route);
+        if (p && [p isKindOfClass:pathCls]) return p;
+      } @catch (__unused NSException *e) { /* 下一个候选 */ }
     }
-    if (!path) return NO;                                          // 造不出可信路径就放弃
-
-    UIViewController *vc = ahaTopVC();
-    if (!vc) return NO;
-
-    // 防堆叠黑屏：先收掉弹层；导航栈超过 2 层（根+1 商品页）就回根再跳
-    UINavigationController *nc = ahaShopeeNav();
-    if (nc) {
-      if (nc.presentedViewController) [nc dismissViewControllerAnimated:NO completion:nil];
-      if (nc.viewControllers.count > 2) [nc popToRootViewControllerAnimated:NO];
-      UIViewController *top = nc.topViewController;
-      if (top) vc = top;
-    } else if (vc.presentedViewController) {
-      [vc dismissViewControllerAnimated:NO completion:nil];
+  }
+  // Ajie 同款兜底：alloc + initWithAppRL:/initWithString:/initWithRoute:（正规初始化器）
+  @try {
+    id p = [pathCls alloc];
+    for (NSString *m in @[@"initWithAppRL:", @"initWithString:", @"initWithRoute:"]) {
+      SEL s = NSSelectorFromString(m);
+      if ([p respondsToSelector:s]) {
+        id q = msgObj(p, s, route);
+        if ([q isKindOfClass:pathCls]) return q;
+      }
     }
+  } @catch (__unused NSException *e) { /* 放弃 */ }
+  return nil;
+}
 
-    for (NSString *m in @[@"navigateFromViewController:destinationPath:navigateOption:completion:",
-                          @"pushFromViewController:destinationPath:pushOption:completion:"]) {
-      SEL sel = NSSelectorFromString(m);
-      if (![nav respondsToSelector:sel]) continue;
-      NSMethodSignature *sig = [navCls instanceMethodSignatureForSelector:sel];
-      // 签名必须恰好 6 段（self,_cmd + 4 参数）且 4 个参数全是对象/标量；否则不碰
-      if (sig.numberOfArguments != 6) continue;
-      if (!ahaArgTypeOk(sig, 2) || !ahaArgTypeOk(sig, 3) || !ahaArgTypeOk(sig, 4) || !ahaArgTypeOk(sig, 5)) continue;
-      void (*fn)(id, SEL, id, id, id, id) = (void (*)(id, SEL, id, id, id, id))objc_msgSend;
-      @try { fn(nav, sel, vc, path, nil, nil); } @catch (__unused NSException *e) { continue; }
-      return YES;
+// —— 组装导航（Ajie navigateWithBTManagerToRoute: 复刻）：
+// 4 种 route 格式轮试 × navigate/push 双候选 ——
+static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
+  ahaStep(@"导航:解析管理器");
+  id nav = ahaResolveManager();
+  if (!nav) { ahaLog(@"i", @"内路由：没找到导航管理器（走网页兜底）"); return NO; }
+
+  // route 4 连（Ajie 实证序）：item_id/shop_id → good_id/shop_id → shopid/itemid → PRODUCT_PAGE
+  NSArray *routes = @[
+    [NSString stringWithFormat:@"rn/PRODUCT_PAGE?item_id=%@&shop_id=%@", itemId, shopId],
+    [NSString stringWithFormat:@"rn/PRODUCT_PAGE?good_id=%@&shop_id=%@", itemId, shopId],
+    [NSString stringWithFormat:@"rn/PRODUCT_PAGE?shopid=%@&itemid=%@", shopId, itemId],
+    [NSString stringWithFormat:@"PRODUCT_PAGE?itemid=%@&shopid=%@", itemId, shopId],
+  ];
+  SEL navSel  = NSSelectorFromString(@"navigateFromViewController:destinationPath:navigateOption:completion:");
+  SEL pushSel = NSSelectorFromString(@"pushFromViewController:destinationPath:pushOption:completion:");
+
+  for (NSString *route in routes) {
+    ahaStep(@"导航:造路径对象");
+    id path = nil;
+    @try { path = ahaBuildPath(route); } @catch (__unused NSException *e) { path = nil; }
+    if (!path) continue;
+    UIViewController *vc = ahaResolvedTopVC();
+    if (!vc) { ahaLog(@"w", @"内路由：拿不到顶层页面"); continue; }
+    if ([nav respondsToSelector:navSel]) {
+      ahaStep(@"导航:navigate 调用");
+      if (ahaInvoke(nav, navSel, @[vc, path, [NSNull null], [NSNull null]], @"navigate")) return YES;
     }
-  } @catch (NSException *e) {
-    ahaLog(@"w", [NSString stringWithFormat:@"App 内导航异常：%@", e.reason]);
-    return NO;
+    if ([nav respondsToSelector:pushSel]) {
+      ahaStep(@"导航:push 调用");
+      if (ahaInvoke(nav, pushSel, @[vc, path, [NSNull null], [NSNull null]], @"push")) return YES;
+    }
   }
   return NO;
 }
@@ -637,25 +716,40 @@ static void ahaRiskAlertShow(void) {
   NSString *itemId   = [NSString stringWithFormat:@"%@", t[@"itemId"] ?: @""];
   NSString *acct     = [NSString stringWithFormat:@"%@", t[@"acct"] ?: @""];
   self.taskLine = [NSString stringWithFormat:@"#%@ [%@] item %@ · 打开商品页", taskId, acct, itemId];
+  ahaStep(@"任务:领到单");
   ahaLog(@"s", [NSString stringWithFormat:@"领到单 #%@ [%@] item %@ shop %@", taskId, acct, itemId, shopId]);
   ahaRefreshUI();
 
-  // App 内路由导航（Ajie 同款：SHPNavigator push 商品页，不跳出 app）；
+  // App 内路由导航（Ajie 同款）：先收弹层回根 → 等 0.4 秒（Ajie 0.35s，不跟回根动画打架）→ 再跳；
   // 路由没打通才退回网页兜底并明确提示
   dispatch_async(dispatch_get_main_queue(), ^{
-    BOOL opened = NO;
-    @try { opened = ahaNavInApp(shopId, itemId); } @catch (NSException *e) {
-      ahaLog(@"e", [NSString stringWithFormat:@"导航异常已拦截：%@", e.reason]);
-      opened = NO;
+    UINavigationController *nc = ahaShopeeNav();
+    if (nc) {
+      if (nc.presentedViewController) [nc dismissViewControllerAnimated:NO completion:nil];
+      if (nc.viewControllers.count > 2) {
+        ahaStep(@"导航:回根");
+        [nc popToRootViewControllerAnimated:NO];
+        ahaLog(@"i", @"栈深超 2 层，先回首页再跳");
+      }
     }
-    if (opened) {
-      ahaLog(@"i", [NSString stringWithFormat:@"已打开商品页 #%@（app 内路由）", itemId]);
-      return;
-    }
-    ahaLog(@"w", @"App 内路由不可用，回退网页打开（请把日志发我）");
-    [[UIApplication sharedApplication] openURL:
-        [NSURL URLWithString:[NSString stringWithFormat:@"https://shopee.tw/product/%@/%@", shopId, itemId]]
-        options:@{} completionHandler:nil];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+      BOOL opened = NO;
+      ahaStep(@"导航:开始");
+      @try { opened = ahaNavInApp(shopId, itemId); } @catch (NSException *e) {
+        ahaLog(@"e", [NSString stringWithFormat:@"导航异常已拦截：%@", e.reason]);
+        opened = NO;
+      }
+      ahaStep(@"导航:结束");
+      if (opened) {
+        ahaLog(@"i", [NSString stringWithFormat:@"已打开商品页 #%@（app 内路由）", itemId]);
+        return;
+      }
+      ahaLog(@"w", @"App 内路由不可用，回退网页打开");
+      [[UIApplication sharedApplication] openURL:
+          [NSURL URLWithString:[NSString stringWithFormat:@"https://shopee.tw/product/%@/%@", shopId, itemId]]
+          options:@{} completionHandler:nil];
+    });
   });
 
   NSString *pid = self.cfg[@"pid"] ?: @"";
@@ -673,6 +767,7 @@ static void ahaRiskAlertShow(void) {
     NSString *via = @"app截包";
     if (!body) {
       ahaLog(@"i", [NSString stringWithFormat:@"#%@ 没等到 app 回包，Direct PDP 兜底直调…", taskId]);
+      ahaStep(@"任务:DirectPDP兜底");
       body = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
       via = @"DirectPDP";
     }
@@ -689,6 +784,7 @@ static void ahaRiskAlertShow(void) {
       self.taskLine = [NSString stringWithFormat:@"#%@ · 上传中（%@，%lu KB）",
           taskId, via, (unsigned long)[body lengthOfBytesUsingEncoding:NSUTF8StringEncoding] / 1024];
       ahaRefreshUI();
+      ahaStep(@"任务:提交");
       [self submit:taskId taskUrl:taskUrl result:body jxServer:jxServer token:subTok];
     });
   });
@@ -1320,6 +1416,13 @@ static void ahaInstallCrashCatcher(void) {
 
 // 启动时读出上次崩溃记录，写进面板日志
 static void ahaReportLastCrash(void) {
+  // 面包屑（最关键：闪退前最后执行的步骤，哪一步死了直接可见）
+  NSString *step = [[NSUserDefaults standardUserDefaults] stringForKey:@"aha_step_v1"];
+  if (step.length) {
+    ahaLog(@"e", [NSString stringWithFormat:@"⚠️ 上次闪退前最后步骤：【%@】", step]);
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"aha_step_v1"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+  }
   NSString *rec = [[NSUserDefaults standardUserDefaults] stringForKey:kAhaCrashKey];
   NSString *sig = nil;
   if (gAhaSigPath[0]) {
@@ -1344,6 +1447,12 @@ static void ahaReportLastCrash(void) {
 %ctor {
   ahaInstallCrashCatcher();  // 最先装，任何闪退都要留下证据
   %init(_ungrouped);         // 没这行，所有钩子都不生效（v0.2.0 血坑）
+  // 6 秒后重装崩溃 handler：Shopee app 启动时会装自己的崩溃处理器把我们覆盖掉
+  //（v0.5.5 崩了没日志的根因），覆盖回去才能持续抓到段错误证据
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
+      dispatch_get_main_queue(), ^{
+    ahaInstallCrashCatcher();
+  });
   gPool = [AHAPool shared];
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
       dispatch_get_main_queue(), ^{
