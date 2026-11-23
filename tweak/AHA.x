@@ -1,4 +1,4 @@
-// AHA.x — Shopee app 内采集客户端 v0.5.6（导航 = Ajie 逐字复刻 + 面包屑诊断）
+// AHA.x — Shopee app 内采集客户端 v0.5.12（导航 = Ajie 逐字复刻 + 面包屑诊断）
 //
 // v0.5.6 关键改动（对照 Ajie 0.1.3 反汇编逐条对齐）：
 //   1. 导航管理器解析：BTAppManager/BTApplicationAddonProvider/SHPNavigator 三类候选
@@ -249,7 +249,8 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
 - (void)inspectRawBody:(NSString *)body url:(NSString *)u request:(NSURLRequest *)req {
   if (!gPool || body.length == 0) return;
   @try {
-    if ([u rangeOfString:kGetPcMark].location == NSNotFound) return;
+    // u 为空 = shp 自家回调通道（拿不到 NSURL），交给下面的形状识别把关
+    if (u.length && [u rangeOfString:kGetPcMark].location == NSNotFound) return;
     if (req && req.allHTTPHeaderFields.count) [self rememberContext:req];
 
     // 风控识别（与 inspectData 同款；delegate 通道拿不到 HTTP 码，只看回包内容）
@@ -268,7 +269,7 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
 
     // shop/item：URL query 优先（mall.shopee.tw 的 get_pc query 里带 item_id/shop_id）
     NSString *shop = nil, *item = nil;
-    NSURLComponents *uc = [NSURLComponents componentsWithString:u];
+    NSURLComponents *uc = u.length ? [NSURLComponents componentsWithString:u] : nil;
     for (NSURLQueryItem *qi in uc.queryItems ?: @[]) {
       if ([qi.name isEqualToString:@"shop_id"]) shop = qi.value;
       if ([qi.name isEqualToString:@"item_id"]) item = qi.value;
@@ -590,18 +591,6 @@ static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
     handler(d, r, e);
   });
 }
-// —— 无 completionHandler 变体：delegate 式会话走这里，只观察不拦截（防漏看）——
-// pdp 请求头快照也在这里记（delegate 会话拿不到 completionHandler，这是 Direct PDP 头的唯一来源）
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
-  ahaObserveURL(request.URL.absoluteString ?: @"");
-  if (request && [request.URL.absoluteString rangeOfString:kPdpMark].location != NSNotFound)
-    [[AHACapture shared] rememberContext:request];
-  return %orig;
-}
-- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)URL {
-  ahaObserveURL(URL.absoluteString ?: @"");
-  return %orig;
-}
 %end
 
 // —— Ajie 1:1 第三钩：NSJSONSerialization（万能兜底）——
@@ -617,91 +606,152 @@ static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
 }
 %end
 
-#pragma mark - Ajie 1:1 第四钩：运行时 swizzle 虾皮 session 的 delegate（原始字节级抓包）
+#pragma mark - Ajie 1:1 第四钩（v0.5.12 = 反汇编逐字对齐版）
 
-// 虾皮用自己的原生 JSON 解析器（观察窗实锤：get_pc 走 delegate 会话且 NSJSONSerialization
-// 没命中）——照 Ajie 的做法：session 创建时拿 delegate 对象 → 对它的类动态装
-// URLSession:dataTask:didReceiveData: / URLSession:task:didCompleteWithError: 钩子，
-// 直接拿原始回包字节，解析器是什么都无所谓
-static IMP gOrigDidReceiveData = NULL;
-static IMP gOrigDidComplete    = NULL;
-static NSMutableDictionary *gDelegatesHooked = nil;   // 类名 → YES，防重复 swizzle
-static NSMutableDictionary *gTaskBuf = nil;           // task 指针串 → 累积的回包字节
+// Ajie 0.1.3 实证结构（装钩 0x41d7c + 钩体 0x42e28/0x43048 + helper 0x43528）：
+//   1) 钩 +[NSURLSession sessionWithConfiguration:delegate:delegateQueue:]（元类），从 delegate 拿类；
+//   2) 选择器优先虾皮自家回调 shpNetworkingModule:shpRequest:didReceiveData:/didCompleteWithError:，
+//      delegate 不响应才回退 URLSession:dataTask:didReceiveData: / URLSession:task:didCompleteWithError:；
+//   3) orig IMP 按类名存两个全局字典（Ajie: BSS 0x63ef0/0x63ef8，NSValue valueWithPointer）——
+//      【v0.5.11 血坑】绝不能放全局槽位：多个 delegate 类会互相覆盖 orig，
+//      A 类回调调到 B 类的 IMP = 堆损坏 → 启动 2 秒后在无关系统代码里随机崩；
+//   4) 钩体先调 orig 再自己处理（Ajie 同序）；
+//   5) 累积字节优先 piggyback 在 request-like 对象上（Ajie 用 keyed subscript），
+//      URLSession task 挂不上就用 gTaskBuf 表兜底。
 
-static void ahaDelegateDidReceiveData(id self, SEL _cmd, NSURLSession *session,
-                                      NSURLSessionDataTask *task, NSData *data);
-static void ahaDelegateDidComplete(id self, SEL _cmd, NSURLSession *session,
-                                   NSURLSessionTask *task, NSError *error);
+static NSMutableDictionary *gOrigDataDict = nil;   // 类名 → orig(didReceiveData 系)
+static NSMutableDictionary *gOrigDoneDict = nil;   // 类名 → orig(didComplete 系)
+static NSMutableDictionary *gTaskBuf = nil;        // 兜底累积表：task 指针串 → 字节
+static NSString *const kAhaBufKey = @"aha_buf_v1"; // piggyback 键
+
+static IMP ahaOrigFor(NSMutableDictionary *dict, id obj) {
+  if (!dict || !obj) return NULL;
+  Class cls = object_getClass(obj);
+  if (!cls) return NULL;
+  NSString *cn = NSStringFromClass(cls);
+  if (cn.length == 0) return NULL;
+  NSValue *v = nil;
+  @synchronized (dict) { v = dict[cn]; }
+  return v ? (IMP)v.pointerValue : NULL;
+}
+
+static void ahaDelegateDidReceiveData(id self, SEL _cmd, id module, id requestLike, NSData *data);
+static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike, NSError *error);
 
 static void ahaSwizzleDelegate(id delegate) {
   if (!delegate) return;
   @try {
     Class cls = object_getClass(delegate);
     if (!cls) return;
-    if (!gDelegatesHooked) gDelegatesHooked = [NSMutableDictionary dictionary];
+    if (!gOrigDataDict) gOrigDataDict = [NSMutableDictionary dictionary];
+    if (!gOrigDoneDict) gOrigDoneDict = [NSMutableDictionary dictionary];
+    if (!gTaskBuf)      gTaskBuf      = [NSMutableDictionary dictionary];
     NSString *cn = NSStringFromClass(cls);
-    @synchronized (gDelegatesHooked) {
-      if (gDelegatesHooked[cn]) return;
-      gDelegatesHooked[cn] = @YES;   // 无论成败只装一次，防止递归
+    if (cn.length == 0) return;
+    BOOL already = NO;
+    @synchronized (gOrigDataDict) { already = (gOrigDataDict[cn] != nil); }
+    @synchronized (gOrigDoneDict) { already = already || (gOrigDoneDict[cn] != nil); }
+    if (already) return;
+
+    // Ajie 同款：优先虾皮自家回调（sel_registerName），不响应才回退 URLSession 系
+    SEL selShpData = sel_registerName("shpNetworkingModule:shpRequest:didReceiveData:");
+    SEL selShpDone = sel_registerName("shpNetworkingModule:shpRequest:didCompleteWithError:");
+    BOOL shpWay = [delegate respondsToSelector:selShpData];
+    SEL selData = shpWay ? selShpData : NSSelectorFromString(@"URLSession:dataTask:didReceiveData:");
+    SEL selDone = [delegate respondsToSelector:selShpDone] ? selShpDone
+                  : NSSelectorFromString(@"URLSession:task:didCompleteWithError:");
+
+    IMP origData = NULL, origDone = NULL;
+    if ([delegate respondsToSelector:selData]) {
+      MSHookMessageEx(cls, selData, (IMP)ahaDelegateDidReceiveData, &origData);
+      if (origData) @synchronized (gOrigDataDict) { gOrigDataDict[cn] = [NSValue valueWithPointer:origData]; }
     }
-    SEL selData = NSSelectorFromString(@"URLSession:dataTask:didReceiveData:");
-    SEL selDone = NSSelectorFromString(@"URLSession:task:didCompleteWithError:");
-    // 只装 delegate 真正实现了的（Ajie 同款 respondsToSelector 探测；默认实现没实现就不装）
-    if ([delegate respondsToSelector:selData])
-      MSHookMessageEx(cls, selData, (IMP)ahaDelegateDidReceiveData, &gOrigDidReceiveData);
-    if ([delegate respondsToSelector:selDone])
-      MSHookMessageEx(cls, selDone, (IMP)ahaDelegateDidComplete, &gOrigDidComplete);
-    ahaLog(@"d", [NSString stringWithFormat:@"已挂钩 session delegate：%@", cn]);
+    if ([delegate respondsToSelector:selDone]) {
+      MSHookMessageEx(cls, selDone, (IMP)ahaDelegateDidComplete, &origDone);
+      if (origDone) @synchronized (gOrigDoneDict) { gOrigDoneDict[cn] = [NSValue valueWithPointer:origDone]; }
+    }
+    ahaLog(@"d", [NSString stringWithFormat:@"已挂钩 session delegate %@（%@）", cn,
+        shpWay ? @"shp 自家回调" : @"URLSession 回调"]);
   } @catch (__unused NSException *e) { /* 静默 */ }
 }
 
-static void ahaDelegateDidReceiveData(id self, SEL _cmd, NSURLSession *session,
-                                      NSURLSessionDataTask *task, NSData *data) {
+static void ahaDelegateDidReceiveData(id self, SEL _cmd, id module, id requestLike, NSData *data) {
+  IMP orig = ahaOrigFor(gOrigDataDict, self);
+  if (orig)
+    ((void (*)(id, SEL, id, id, NSData *))orig)(self, _cmd, module, requestLike, data); // Ajie 同序：先过 orig
   @try {
-    if (!gTaskBuf) gTaskBuf = [NSMutableDictionary dictionary];
-    NSString *key = [NSString stringWithFormat:@"%p", task];
-    NSMutableData *buf = nil;
-    @synchronized (gTaskBuf) {
-      buf = gTaskBuf[key];
-      if (!buf) { buf = [NSMutableData data]; gTaskBuf[key] = buf; }
-      if (buf.length + data.length > 2 * 1024 * 1024) {   // 单任务 2MB 封顶，防吃内存
-        [gTaskBuf removeObjectForKey:key];
-      } else if (data.length) {
-        [buf appendData:data];
-      }
-      if (gTaskBuf.count > 128) {                          // 任务表防膨胀
-        NSString *first = gTaskBuf.allKeys.firstObject;
-        if (first) [gTaskBuf removeObjectForKey:first];
-      }
-    }
-  } @catch (__unused NSException *e) { /* 静默 */ }
-  if (gOrigDidReceiveData)
-    ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))gOrigDidReceiveData)
-        (self, _cmd, session, task, data);
-}
-
-static void ahaDelegateDidComplete(id self, SEL _cmd, NSURLSession *session,
-                                   NSURLSessionTask *task, NSError *error) {
-  @try {
-    NSString *key = [NSString stringWithFormat:@"%p", task];
-    NSData *bufData = nil;
-    @synchronized (gTaskBuf) {
-      NSMutableData *buf = gTaskBuf[key];
-      bufData = buf ? [NSData dataWithData:buf] : nil;
-      [gTaskBuf removeObjectForKey:key];
-    }
-    if (bufData && !error && task) {
+    if (!requestLike || !data.length) return;
+    if ([requestLike isKindOfClass:[NSURLSessionTask class]]) {
+      // URLSession 路径：pdp 请求头快照（原无 completionHandler 钩子的职责，Ajie 也在这里记上下文）
+      NSURLSessionTask *task = (NSURLSessionTask *)requestLike;
       NSURLRequest *req = task.currentRequest;
-      NSString *u = req.URL.absoluteString ?: @"";
-      if ([u rangeOfString:kGetPcMark].location != NSNotFound) {
-        NSString *body = [[NSString alloc] initWithData:bufData encoding:NSUTF8StringEncoding];
-        [[AHACapture shared] inspectRawBody:body url:u request:req];
+      if (req && req.allHTTPHeaderFields.count &&
+          [req.URL.absoluteString rangeOfString:kPdpMark].location != NSNotFound)
+        [[AHACapture shared] rememberContext:req];
+      // 累积字节走兜底表
+      NSString *key = [NSString stringWithFormat:@"%p", task];
+      @synchronized (gTaskBuf) {
+        NSMutableData *buf = gTaskBuf[key];
+        if (!buf) { buf = [NSMutableData data]; gTaskBuf[key] = buf; }
+        if (buf.length + data.length > 2 * 1024 * 1024) {   // 单任务 2MB 封顶
+          [gTaskBuf removeObjectForKey:key];
+        } else {
+          [buf appendData:data];
+        }
+        if (gTaskBuf.count > 128) {                         // 任务表防膨胀
+          NSString *first = gTaskBuf.allKeys.firstObject;
+          if (first) [gTaskBuf removeObjectForKey:first];
+        }
       }
+    } else if ([requestLike respondsToSelector:@selector(objectForKeyedSubscript:)] &&
+               [requestLike respondsToSelector:@selector(setObject:forKeyedSubscript:)]) {
+      // Ajie 同款：shp 请求对象是字典式的，累积字节直接挂它身上
+      NSMutableData *buf = [requestLike objectForKeyedSubscript:kAhaBufKey];
+      if (![buf isKindOfClass:[NSMutableData class]]) {
+        buf = [NSMutableData data];
+        [requestLike setObject:buf forKeyedSubscript:kAhaBufKey];
+      }
+      [buf appendData:data];
     }
   } @catch (__unused NSException *e) { /* 静默 */ }
-  if (gOrigDidComplete)
-    ((void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *))gOrigDidComplete)
-        (self, _cmd, session, task, error);
+}
+
+static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike, NSError *error) {
+  IMP orig = ahaOrigFor(gOrigDoneDict, self);
+  if (orig)
+    ((void (*)(id, SEL, id, id, NSError *))orig)(self, _cmd, module, requestLike, error); // Ajie 同序
+  @try {
+    if (error || !gPool) return;             // Ajie 同款：有错不处理
+    NSData *bufData = nil;
+    BOOL isTask = [requestLike isKindOfClass:[NSURLSessionTask class]];
+    if ([requestLike respondsToSelector:@selector(objectForKeyedSubscript:)]) {
+      id pig = [requestLike objectForKeyedSubscript:kAhaBufKey];
+      if ([pig isKindOfClass:[NSData class]]) {
+        bufData = [NSData dataWithData:pig];
+        if ([requestLike respondsToSelector:@selector(removeObjectForKeyedSubscript:)])
+          [requestLike removeObjectForKeyedSubscript:kAhaBufKey];   // 取完即清，防重复投递
+      }
+    }
+    if (!bufData && isTask) {
+      NSString *key = [NSString stringWithFormat:@"%p", requestLike];
+      @synchronized (gTaskBuf) {
+        NSMutableData *buf = gTaskBuf[key];
+        bufData = buf ? [NSData dataWithData:buf] : nil;
+        [gTaskBuf removeObjectForKey:key];
+      }
+    }
+    if (bufData.length == 0) return;
+    NSString *u = @"";
+    NSURLRequest *req = nil;
+    if (isTask) {
+      req = ((NSURLSessionTask *)requestLike).currentRequest;
+      u = req.URL.absoluteString ?: @"";
+      if (u.length && [u rangeOfString:kGetPcMark].location == NSNotFound) return;
+    }
+    // shp 通道拿不到 URL：u 传空串，inspectRawBody 跳过 URL 过滤、只靠形状识别把关
+    NSString *body = [[NSString alloc] initWithData:bufData encoding:NSUTF8StringEncoding];
+    [[AHACapture shared] inspectRawBody:body url:u request:req];
+  } @catch (__unused NSException *e) { /* 静默 */ }
 }
 
 %hook NSURLSession
