@@ -193,11 +193,20 @@ static NSURLSession *AhaSession(NSURLSessionConfiguration *cfg) {
 
 #pragma mark - App 内路由导航（Ajie 实证做法：Shopee 自带 SHPNavigator，绝不跳出 app）
 
+// 拿我们自己的悬浮窗（AHAUI 在后面才实现，属性走运行时取）
+static UIWindow *ahaOwnWin(void) {
+  if (!gUI) return nil;
+  SEL s = NSSelectorFromString(@"win");
+  if (![(id)gUI respondsToSelector:s]) return nil;
+  return ((id(*)(id, SEL))objc_msgSend)((id)gUI, s);
+}
+
 // 找 Shopee 自己窗口的当前 VC（跳过我们的悬浮窗）
 static UIViewController *ahaTopVC(void) {
   UIViewController *fallback = nil;
+  UIWindow *own = ahaOwnWin();
   for (UIWindow *w in [UIApplication sharedApplication].windows) {
-    if (gUI && w == gUI.win) continue;
+    if (w == own) continue;
     UIViewController *vc = w.rootViewController;
     if (!vc) continue;
     if (!fallback) fallback = vc;
@@ -215,8 +224,9 @@ static UIViewController *ahaTopVC(void) {
 
 // 找 Shopee 自己的导航控制器（收弹层/控栈深用）
 static UINavigationController *ahaShopeeNav(void) {
+  UIWindow *own = ahaOwnWin();
   for (UIWindow *w in [UIApplication sharedApplication].windows) {
-    if (gUI && w == gUI.win) continue;
+    if (w == own) continue;
     UIViewController *vc = w.rootViewController;
     if (!vc) continue;
     if ([vc isKindOfClass:[UITabBarController class]])
