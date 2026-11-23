@@ -294,9 +294,14 @@ static BOOL ahaInvoke(id target, SEL sel, NSArray *args, NSString *tag) {
 // 类候选 → 单例 getter → 属性钻取，验收 = 对象响应导航方法 ——
 static BOOL ahaRespondsNav(id obj) {
   if (!obj) return NO;
-  SEL a = NSSelectorFromString(@"navigateFromViewController:destinationPath:navigateOption:completion:");
-  SEL b = NSSelectorFromString(@"pushFromViewController:destinationPath:pushOption:completion:");
-  return [obj respondsToSelector:a] || [obj respondsToSelector:b];
+  // v0.5.9：Ajie 实证的商品直开三连也算导航能力——BTAppManager 本尊往往只认这几个，
+  // 之前只认 navigate/push 会把正牌 manager 拒之门外
+  for (NSString *m in @[@"navigateFromViewController:destinationPath:navigateOption:completion:",
+                        @"pushFromViewController:destinationPath:pushOption:completion:",
+                        @"navigateToProduct:goodID:", @"openProductPage:goodID:", @"openProduct:goodID:"]) {
+    if ([obj respondsToSelector:NSSelectorFromString(m)]) return YES;
+  }
+  return NO;
 }
 
 static id ahaMsgObj0(id obj, SEL s) {
@@ -418,6 +423,21 @@ static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
       if (ahaInvoke(nav, pushSel, @[vc, path, [NSNull null], [NSNull null]], @"push")) return YES;
     }
   }
+
+  // —— Ajie 兜底级（invokeRouteNavigationOnManager 实证）：manager 自带的商品直开方法，
+  //    不需要路径对象，参数 [shopID, itemID]（nil→@""，Ajie 同款 csel）——
+  //    虾皮 3.50.50 上路径工厂对不上时，这才是正牌出路
+  NSString *shop = shopId ?: @"", *item = itemId ?: @"";
+  for (NSString *m in @[@"navigateToProduct:goodID:", @"openProductPage:goodID:", @"openProduct:goodID:"]) {
+    SEL s = NSSelectorFromString(m);
+    if (![nav respondsToSelector:s]) continue;
+    ahaStep(@"导航:商品直开");
+    if (ahaInvoke(nav, s, @[shop, item], m)) {
+      ahaLog(@"i", [NSString stringWithFormat:@"内路由：%@ 调用成功", m]);
+      return YES;
+    }
+  }
+  ahaLog(@"w", @"内路由全部候选失败（路径式+商品直开），任务将回池重试");
   return NO;
 }
 
@@ -754,10 +774,9 @@ static void ahaRiskAlertShow(void) {
         ahaLog(@"i", [NSString stringWithFormat:@"已打开商品页 #%@（app 内路由）", itemId]);
         return;
       }
-      ahaLog(@"w", @"App 内路由不可用，回退网页打开");
-      [[UIApplication sharedApplication] openURL:
-          [NSURL URLWithString:[NSString stringWithFormat:@"https://shopee.tw/product/%@/%@", shopId, itemId]]
-          options:@{} completionHandler:nil];
+      // v0.5.9：不再跳 Safari——Safari 是独立进程，get_pc 抓不到纯属白跑；
+      // 直接等 Direct PDP 兜底（重放 app 请求头直调 get_pc），拿不到就回池
+      ahaLog(@"w", @"App 内路由不可用，靠 Direct PDP 兜底直取数据");
     });
   });
 
