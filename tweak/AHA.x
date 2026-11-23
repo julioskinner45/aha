@@ -279,14 +279,27 @@ static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
     if (!nav) return NO;
 
     NSString *route = [NSString stringWithFormat:@"rn/PRODUCT_PAGE?item_id=%@&shop_id=%@", itemId, shopId];
+    // 候选清单与顺序照抄 Ajie 实证（它 dylib 里的路径工厂候选就是这个序）：
+    //   AppRL 系列（Shopee 正牌 App Route Link API）→ String → Route → alloc/init 兜底
     id path = nil;
     id (*msgObj)(id, SEL, id) = (id(*)(id, SEL, id))objc_msgSend;
-    for (NSString *m in @[@"pathWithString:", @"pathWithRoute:", @"navigationPathWithString:"]) {
+    for (NSString *m in @[@"pathWithAppRL:", @"navigationPathWithAppRL:",
+                          @"pathWithString:", @"navigationPathWithString:", @"pathWithRoute:"]) {
       SEL s = NSSelectorFromString(m);
       if ([pathCls respondsToSelector:s]) {
         id p = msgObj(pathCls, s, route);
         if (p && [p isKindOfClass:pathCls]) { path = p; break; }   // 对象必须经类校验
       }
+    }
+    if (!path) {
+      // Ajie 同款兜底：alloc + initWithAppRL:/initWithString:/initWithRoute:（正规初始化器，非瞎猜）
+      @try {
+        id p = [[pathCls alloc] init];
+        for (NSString *m in @[@"initWithAppRL:", @"initWithString:", @"initWithRoute:"]) {
+          SEL s = NSSelectorFromString(m);
+          if ([p respondsToSelector:s]) { id q = msgObj(p, s, route); if ([q isKindOfClass:pathCls]) { path = q; break; } }
+        }
+      } @catch (__unused NSException *e) { path = nil; }
     }
     if (!path) return NO;                                          // 造不出可信路径就放弃
 
