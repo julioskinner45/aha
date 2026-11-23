@@ -47,7 +47,7 @@ S_ATTR_SOME_INSTRUCTIONS = 0x00000400
 
 DYLIB_NAME = 'AHA.dylib'
 PLIST_NAME = 'AHA.plist'
-PKG_VER = '0.2.0'
+PKG_VER = '0.3.0'
 
 
 def pad8(b):
@@ -166,19 +166,19 @@ def dir_entries(root_prefix):
 
 def build_deb(dylib_bytes, plist_bytes, panel_bytes, control_text):
     ctl = control_text.rstrip('\n')
-    size_kb = math.ceil((len(dylib_bytes) + len(plist_bytes) + len(panel_bytes)) / 1024)
+    size_kb = math.ceil((len(dylib_bytes) + len(plist_bytes) + len(panel_bytes or b'')) / 1024)
     lines = [l for l in ctl.split('\n') if not l.startswith('Installed-Size:')]
     lines.append('Installed-Size: %d' % size_kb)
     ctl_bytes = ('\n'.join(lines) + '\n').encode('utf-8')
 
     DL = 'var/jb/Library/MobileSubstrate/DynamicLibraries'
     SH = 'var/jb/share/aha'
-    data_tar = make_tar(
-        dir_entries('var/jb/Library/MobileSubstrate/DynamicLibraries')
-        + dir_entries('var/jb/share/aha')
+    data_items = (dir_entries('var/jb/Library/MobileSubstrate/DynamicLibraries')
         + [(DL + '/' + DYLIB_NAME, dylib_bytes, 0o755, False),
-           (DL + '/' + PLIST_NAME, plist_bytes, 0o644, False),
-           (SH + '/aha-panel.html', panel_bytes, 0o644, False)])
+           (DL + '/' + PLIST_NAME, plist_bytes, 0o644, False)])
+    if panel_bytes:
+        data_items += dir_entries('var/jb/share/aha') +             [(SH + '/aha-panel.html', panel_bytes, 0o644, False)]
+    data_tar = make_tar(data_items)
     control_tar = make_tar([('.', b'', 0o755, True), ('./control', ctl_bytes, 0o644, False)])
 
     payloads = [b'2.0\n', control_tar, data_tar]
@@ -249,7 +249,7 @@ def main():
         print('    (stub = installable structure only; use --dylib from cloud-build for logic)')
 
     plist = open(os.path.join(HERE, 'tweak', PLIST_NAME), 'rb').read()
-    panel = open(PANEL, 'rb').read()
+    panel = open(PANEL, 'rb').read() if PANEL and os.path.exists(PANEL) else None
     ctl = open(os.path.join(HERE, 'tweak', 'control'), encoding='utf-8').read()
     blob = build_deb(dylib, plist, panel, ctl)
 

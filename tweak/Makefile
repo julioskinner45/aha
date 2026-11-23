@@ -5,7 +5,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = AHA
 AHA_FILES = AHA.x
-AHA_FRAMEWORKS = UIKit WebKit Foundation
+AHA_FRAMEWORKS = UIKit Foundation
 AHA_CFLAGS = -fobjc-arc
 
 include $(THEOS_MAKE_PATH)/tweak.mk
