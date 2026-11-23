@@ -500,7 +500,7 @@ static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
   return [NSString stringWithFormat:@"● 运行中 · %@", self.me ?: @""];
 }
 - (NSString *)counterText {
-  return [NSString stringWithFormat:@"领 %ld · 成 %ld", (long)self.taken, (long)self.ok];
+  return [NSString stringWithFormat:@"成功 %ld", (long)self.ok];
 }
 - (NSString *)taskText { return self.taskLine ?: @""; }
 
@@ -686,9 +686,16 @@ static void ahaRiskAlertShow(void) {
         }
         NSDictionary *t = j[@"task"];
         if (![t isKindOfClass:[NSDictionary class]] || !t.count) {
-          double wait = [j[@"waitMs"] isKindOfClass:[NSNumber class]]
-              ? [j[@"waitMs"] doubleValue] / 1000.0 : 0;
-          if (wait < 1) wait = [self randomGap];
+          // 没单时的等待节奏：用户在面板设了间隔（非 0-0）→ 按自己设的来；
+          // 默认 0-0 才听中枢 waitMs 派单节奏（v0.5.7 前一直被中枢 3s 盖住）
+          NSInteger glo = [self num:@"gapMin" def:0], ghi = [self num:@"gapMax" def:0];
+          double wait;
+          if (glo > 0 || ghi > 0) {
+            wait = [self randomGap];
+          } else {
+            wait = [j[@"waitMs"] isKindOfClass:[NSNumber class]]
+                ? [j[@"waitMs"] doubleValue] / 1000.0 : 0;
+          }
           self.taskLine = @"";
           ahaLog(@"i", [NSString stringWithFormat:@"池子暂无单，%.0f 秒后再领", wait]);
           ahaRefreshUI();
@@ -1245,7 +1252,7 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   if (mini) {
     CGRect scr = [UIScreen mainScreen].bounds;
     self.mini.frame = CGRectMake(scr.size.width - 78, MIN(MAX(self.panel.frame.origin.y + 20, 60), scr.size.height - 60), 64, 30);
-    self.miniInfo.text = [NSString stringWithFormat:@"%ld/%ld", (long)gPool.taken, (long)gPool.ok];
+    self.miniInfo.text = [NSString stringWithFormat:@"成 %ld", (long)gPool.ok];
   }
 }
 - (void)miniTapped { [self collapse:NO]; }
@@ -1305,7 +1312,7 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
     [self.startBtn setTitle:@"▶ 开始采集" forState:UIControlStateNormal];
     self.startBtn.backgroundColor = AhaColor(34, 170, 90, 1);
   }
-  self.miniInfo.text = [NSString stringWithFormat:@"%ld/%ld", (long)gPool.taken, (long)gPool.ok];
+  self.miniInfo.text = [NSString stringWithFormat:@"成 %ld", (long)gPool.ok];
   NSArray *lines = gPool.logLines;
   if (lines.count) {
     self.logView.text = [lines componentsJoinedByString:@"\n"];

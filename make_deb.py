@@ -47,7 +47,7 @@ S_ATTR_SOME_INSTRUCTIONS = 0x00000400
 
 DYLIB_NAME = 'AHA.dylib'
 PLIST_NAME = 'AHA.plist'
-PKG_VER = '0.5.7'
+PKG_VER = '0.5.8'
 
 
 def pad8(b):
