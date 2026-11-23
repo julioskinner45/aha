@@ -1,7 +1,10 @@
 name: Build AHA .deb
 
-# 新账号 GitHub 会自动取消 macOS runner 的任务（反滥用），但 Ubuntu 不限制。
-# Theos 官方支持 Linux 交叉编译 iOS tweak，本工作流在 ubuntu-latest 上出最终 .deb。
+# 新账号 GitHub 会自动取消 macOS runner 任务（反滥用），Ubuntu 不限制。
+# 手动装 Theos（绕开 install-theos 脚本的 api.github.com 限流问题）：
+#   1) git clone --recursive 直接带上 sdks 子模块
+#   2) 工具链/ldid 走 GitHub Releases 直链（不走 REST API，无限流）
+#   3) python 打包出最终 .deb
 
 on:
   workflow_dispatch:
@@ -12,16 +15,31 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    env:
+      THEOS: ${{ github.workspace }}/theos
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Theos (Linux toolchain + sdks + ldid)
+      - name: System deps
         run: |
-          bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
-          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
-          ls "$HOME/theos" | head -20
+          sudo apt-get update
+          sudo apt-get install -y build-essential fakeroot rsync perl libxml2 libtinfo6 xz-utils curl
+          curl -sL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64 -o /tmp/ldid
+          chmod +x /tmp/ldid && sudo mv /tmp/ldid /usr/local/bin/ldid
+          ldid -V || true
+
+      - name: Install Theos + sdks (git 协议，绕开 API 限流)
+        run: |
+          git clone --depth 1 --recursive https://github.com/theos/theos.git "$THEOS"
+          ls "$THEOS" | head
+          ls "$THEOS/sdks" | grep -i iphone | head -3
+
+      - name: Install iOS toolchain (clang for apple targets)
+        run: |
+          curl -sL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz | tar -xJ -C "$THEOS/toolchain/"
+          test -x "$THEOS/toolchain/linux/iphone/bin/clang" && "$THEOS/toolchain/linux/iphone/bin/clang" --version | head -2
 
       - name: Build AHA.dylib (rootless / arm64)
         working-directory: tweak
