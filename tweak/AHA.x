@@ -921,10 +921,10 @@ static void ahaRefreshUI(void) {
   });
 }
 
-#pragma mark - 入口（显式 %ctor 必须手动 %init —— v0.2.0 的血坑）
+#pragma mark - 入口（显式自定义构造函数必须手动初始化钩子组 —— v0.2.0 的血坑）
 
 %ctor {
-  %init(_ungrouped);         // 没这行，所有 %hook 都不生效（v0.2.0 血坑）
+  %init(_ungrouped);         // 没这行，所有钩子都不生效（v0.2.0 血坑）
   gPool = [AHAPool shared];
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
       dispatch_get_main_queue(), ^{
