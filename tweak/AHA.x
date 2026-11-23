@@ -285,6 +285,12 @@ static NSURLSession *AhaSession(NSURLSessionConfiguration *cfg) {
   else if ([lv isEqualToString:@"e"]) line = [NSString stringWithFormat:@"✖ %@", msg];
   else if ([lv isEqualToString:@"w"]) line = [NSString stringWithFormat:@"⚠ %@", msg];
   else line = msg;
+  static NSDateFormatter *df; static dispatch_once_t dOnce;
+  dispatch_once(&dOnce, ^{
+    df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"HH:mm:ss";
+  });
+  line = [NSString stringWithFormat:@"%@ %@", [df stringFromDate:[NSDate date]], line];
   @synchronized (_logs) {
     [_logs addObject:line];
     if (_logs.count > 250) [_logs removeObjectsInRange:NSMakeRange(0, _logs.count - 250)];
@@ -779,10 +785,11 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   ahaTap(self.gearBtn,  ^{ [[AHAUI shared] showSettings]; });
   ahaTap(self.miniBtn,  ^{ [[AHAUI shared] collapse:YES]; });
   ahaTap(self.startBtn, ^{
+    [self.panel endEditing:YES];
     if (gPool.running) [gPool stopLoop];
     else [gPool startLoop];          // 未登录会自动先登录再开始
   });
-  ahaTap(self.resetBtn, ^{ [gPool resetCounters]; ahaLog(@"i", @"计数已清零"); });
+  ahaTap(self.resetBtn, ^{ [self.panel endEditing:YES]; [gPool resetCounters]; ahaLog(@"i", @"计数已清零"); });
 
   // 输入框预填（间隔默认 0-0）+ 失焦保存
   self.userField.text = gPool.cfg[@"user"] ?: @"";
@@ -806,6 +813,7 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
 }
 
 - (void)fieldsChanged {
+  [self.panel endEditing:YES];      // 保存完把键盘收回去
   gPool.cfg[@"user"] = self.userField.text ?: @"";
   NSString *s = [self.gapField.text stringByReplacingOccurrencesOfString:@" " withString:@""];
   NSArray *parts = [s componentsSeparatedByString:@"-"];
