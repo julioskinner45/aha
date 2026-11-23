@@ -1,0 +1,63 @@
+name: Build AHA .deb
+
+# 无需苹果电脑：GitHub 提供的 macOS runner 自带正版 Xcode / iPhoneOS SDK。
+# 公开仓库免费；push 即自动构建，也可在 Actions 页面手动点 "Run workflow"。
+# 构建产物 = 最终可直接安装的 .deb（真功能 AHA.dylib 版），在本次运行的
+# Artifacts 区下载 AHA-deb.zip，解压即得。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ldid (Theos signing)
+        run: brew install ldid
+
+      - name: Install Theos (含 sdks 子模块)
+        run: |
+          git clone --depth 1 --recursive https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Link Xcode iPhoneOS SDK into Theos
+        run: |
+          mkdir -p "$THEOS/sdks"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          VER="$(xcrun --sdk iphoneos --show-sdk-version)"
+          ln -sfn "$SDK" "$THEOS/sdks/iPhoneOS${VER}.sdk"
+          echo "SDK = $SDK   version = $VER"
+
+      - name: Build AHA.dylib (rootless / arm64)
+        working-directory: tweak
+        run: |
+          export THEOS_PACKAGE_SCHEME=rootless
+          make clean || true
+          make FINALPACKAGE=1 ARCHS=arm64
+          DYLIB="$(find . -name 'AHA.dylib' -not -path '*packages*' | head -1)"
+          test -n "$DYLIB" || { echo "AHA.dylib 没找到"; exit 1; }
+          echo "DYLIB_PATH=$DYLIB" >> "$GITHUB_ENV"
+          file "$DYLIB"
+
+      - name: Pack final .deb (真功能版)
+        run: |
+          python3 make_deb.py --dylib "$DYLIB_PATH"
+          DEB="$(ls out/aha_*.deb | head -1)"
+          echo "== final deb =="
+          ls -la "$DEB"
+          python3 make_deb.py --inspect "$DEB"
+
+      - name: Upload final .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: AHA-deb
+          path: out/aha_*.deb
+          if-no-files-found: error
+          retention-days: 14

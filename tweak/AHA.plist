@@ -1,0 +1,14 @@
+{
+	Filter = {
+		Bundles = (
+			"com.beeasy.shopee.tw",
+			"com.shopee.tw",
+			"com.shopee.shopeetw",
+			"com.shopee.shopee.tw"
+		);
+		Executables = (
+			"Shopee",
+			"ShopeeTW"
+		);
+	};
+}

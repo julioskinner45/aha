@@ -1,0 +1,14 @@
+Package: com.aha.mobile
+Name: AHA
+Version: 0.2.0
+Architecture: iphoneos-arm64
+Maintainer: aha
+Author: aha
+Section: Tweaks
+Depends: firmware (>= 14.0), mobilesubstrate | ellekit
+Description: AHA - in-app collection client for the team tenant pool.
+ Floating panel inside the Shopee app: configure hub address and tenant
+ account, take tasks from your own pool, passively capture the app's own
+ product API responses and submit them back. No jailbreak hiding,
+ no detection evasion, no response tampering.
+

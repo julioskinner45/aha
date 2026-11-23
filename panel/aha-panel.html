@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>AHA</title>
+<style>
+  :root{
+    --bg:#0f1420; --card:#171e2e; --line:#2a3448; --txt:#e8edf7; --sub:#8a97b0;
+    --accent:#3b82f6; --accent-soft:#1d2a44; --warn:#f59e0b; --ok:#22c55e; --err:#ef4444;
+    --mono:ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;background:var(--bg);color:var(--txt);font:13px/1.55 -apple-system,"PingFang SC",sans-serif}
+  .wrap{padding:12px}
+  .banner{background:var(--accent-soft);border:1px solid var(--line);border-radius:10px;padding:9px 12px;font-size:11.5px;color:#9fc2ff;margin-bottom:11px}
+  .banner b{color:#fff}
+  h1{font-size:18px;margin:0 0 2px;letter-spacing:1px}
+  h1 b{color:var(--accent)}
+  .sub{color:var(--sub);font-size:11px;margin-bottom:11px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:11px;padding:12px 13px;margin-bottom:10px}
+  .card h2{font-size:12.5px;margin:0 0 9px;display:flex;align-items:center;gap:6px;color:#c6d2e8}
+  .card h2 span{width:3px;height:12px;background:var(--accent);border-radius:2px}
+  .card h2 .r{margin-left:auto;font-size:10.5px;color:var(--sub);font-weight:400}
+  label{display:block;font-size:11px;color:var(--sub);margin:7px 0 3px}
+  input[type=text],input[type=password]{
+    width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#101624;color:var(--txt);font-size:13px;outline:none}
+  input:focus{border-color:var(--accent)}
+  .row{display:flex;gap:8px}.row>div{flex:1}
+  .hint{font-size:10.5px;color:var(--sub);margin-top:5px;line-height:1.6}
+  .sw{display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px dashed var(--line)}
+  .sw:last-child{border-bottom:0}
+  .sw .t{font-size:12.5px}.sw .d{font-size:10.5px;color:var(--sub)}
+  .toggle{position:relative;width:42px;height:24px;flex:none}
+  .toggle input{display:none}
+  .slider{position:absolute;inset:0;background:#39435a;border-radius:24px;transition:.2s;cursor:pointer}
+  .slider:before{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}
+  .toggle input:checked+.slider{background:var(--accent)}
+  .toggle input:checked+.slider:before{transform:translateX(18px)}
+  button{border:1px solid var(--line);background:#1c2536;color:var(--txt);border-radius:8px;padding:9px 13px;font-size:13px;cursor:pointer}
+  button:active{transform:scale(.97)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+  button.go{background:var(--ok);border-color:var(--ok);color:#06220f;font-weight:700}
+  button.stopb{background:#3a1d22;border-color:#7f2d36;color:#ffb4bd;font-weight:600}
+  button:disabled{opacity:.4}
+  .btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:9px}
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}
+  .stat{background:var(--accent-soft);border-radius:8px;padding:8px 4px;text-align:center}
+  .stat .n{font:600 18px/1.2 var(--mono);color:#7fb0ff}
+  .stat .l{font-size:10px;color:var(--sub);margin-top:1px}
+  .pool{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-bottom:8px}
+  .pool .p{background:#101624;border:1px solid var(--line);border-radius:8px;padding:7px;text-align:center}
+  .pool .p .n{font:600 16px/1.2 var(--mono);color:var(--ok)}
+  .pool .p .l{font-size:10px;color:var(--sub)}
+  #log{background:#0a0e18;border:1px solid var(--line);border-radius:8px;padding:9px 10px;height:170px;overflow:auto;font:11px/1.65 var(--mono);white-space:pre-wrap;word-break:break-all}
+  #log .t{color:#4b5c78}#log .i{color:#7fb0ff}#log .w{color:#f5c76a}#log .e{color:#ff9b9b}#log .s{color:#7fe8a3}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#5a657e;margin-right:4px}
+  .dot.on{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+  #taskNow{font:11.5px var(--mono);color:#9fc2ff;background:#101624;border:1px solid var(--line);border-radius:8px;padding:7px 10px;margin-top:8px;display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><b>AHA</b> <span style="font-size:11px;color:var(--sub);font-weight:400">Shopee app 内采集</span></h1>
+  <div class="sub">租用账号领单 → app 内浏览商品 → 自动截获回包 → 回传</div>
+
+  <!-- 连接与账号 -->
+  <div class="card">
+    <h2><span></span>配置 <span class="r" id="connTxt"><span class="dot"></span>未连接</span></h2>
+    <label>中枢地址（租户中控）</label>
+    <input type="text" id="server" placeholder="https://140.235.98.220:29690">
+    <label>租用账号</label>
+    <input type="text" id="user" placeholder="子后台账号" autocomplete="off">
+    <label>密码</label>
+    <input type="password" id="pass" autocomplete="off">
+    <label>窗口名（本机身份，自动生成即可）</label>
+    <input type="text" id="pid" placeholder="phone-xxxx">
+    <div class="btns">
+      <button class="primary" onclick="cmd('save')">保存配置</button>
+      <button onclick="cmd('connect')">连接</button>
+      <button onclick="cmd('refresh')">刷新</button>
+    </div>
+    <div class="hint">保存后配置只存在本机（系统偏好里），账号=你名下的租用账号，对应你自己的任务池和聚星子账号。</div>
+  </div>
+
+  <!-- 状态 -->
+  <div class="card hideMini">
+    <h2><span></span>池状态（你自己的池）</h2>
+    <div class="pool">
+      <div class="p"><div class="n" id="pIdle">-</div><div class="l">待领</div></div>
+      <div class="p"><div class="n" id="pLeased">-</div><div class="l">在途</div></div>
+      <div class="p"><div class="n" id="pWin">-</div><div class="l">在线窗口</div></div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="n" id="sTaken">0</div><div class="l">领单</div></div>
+      <div class="stat"><div class="n" id="sOk">0</div><div class="l">成功</div></div>
+      <div class="stat"><div class="n" id="sRun">停止</div><div class="l">运行</div></div>
+      <div class="stat"><div class="n" id="sRest">关</div><div class="l">休息开关</div></div>
+    </div>
+    <div id="taskNow"></div>
+  </div>
+
+  <!-- 运行参数 -->
+  <div class="card">
+    <h2><span></span>运行参数</h2>
+    <div class="row">
+      <div><label>最小间隔（秒）</label><input type="number" id="gapMin" value="8" min="1"></div>
+      <div><label>最大间隔（秒）</label><input type="number" id="gapMax" value="20" min="1"></div>
+    </div>
+    <label>每 N 轮休息一次（0 = 不休息）</label>
+    <input type="number" id="restEvery" value="10" min="0">
+    <label>休息时长（秒）</label>
+    <input type="number" id="restSec" value="60" min="1">
+    <div class="sw" style="margin-top:8px"><div><div class="t">领单循环</div><div class="d">自动领单→浏览→截包→上传</div></div>
+      <label class="toggle"><input type="checkbox" id="autoTake" onchange="cmd('save')"><span class="slider"></span></label></div>
+    <div class="sw"><div><div class="t">休息开关</div><div class="d">手动暂停循环</div></div>
+      <label class="toggle"><input type="checkbox" id="rest" onchange="cmd('save')"><span class="slider"></span></label></div>
+    <div class="sw"><div><div class="t">小窗口模式</div><div class="d">收窄面板</div></div>
+      <label class="toggle"><input type="checkbox" id="mini" onchange="cmd('save');cmd('mini')"><span class="slider"></span></label></div>
+    <div class="btns">
+      <button class="go" id="btnRun" onclick="cmd('start')">▶ 开始循环</button>
+      <button onclick="cmd('take')">领一单（手动）</button>
+      <button onclick="cmd('reset')">重置统计</button>
+    </div>
+    <div class="hint">领到的单 5 分钟内会自动完成（浏览商品→截获 get_pc→提交），超时自动回池不丢。</div>
+  </div>
+
+  <!-- 日志 -->
+  <div class="card">
+    <h2><span></span>日志 <button style="margin-left:auto;padding:4px 9px;font-size:11px" onclick="cmd('clearlog')">清空</button></h2>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+(function(){
+"use strict";
+var $=function(id){return document.getElementById(id)};
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+
+function log(msg,lv){lv=lv||'i';var el=$('log');var d=document.createElement('div');
+  d.innerHTML='<span class="t">['+new Date().toTimeString().slice(0,8)+']</span> <span class="'+lv+'">'+msg+'</span>';
+  el.appendChild(d);while(el.children.length>300)el.removeChild(el.firstChild);
+  el.scrollTop=el.scrollHeight}
+
+/* 原生 → JS */
+window.__ahaLog=function(msg,lv){log(esc(msg),lv)};
+window.__ahaState=function(json){
+  var s=(typeof json==='string')?(function(){try{return JSON.parse(json)}catch(e){return null}})():json;
+  if(!s)return;
+  if(s.cfg){
+    ['server','user','pid','gapMin','gapMax','restEvery','restSec'].forEach(function(k){
+      if($(k)&&s.cfg[k]!=null)$(k).value=s.cfg[k]});
+    $('pass').value=s.cfg.pass||'';
+    $('autoTake').checked=!!s.cfg.autoTake;
+    $('rest').checked=!!s.cfg.rest;
+    $('mini').checked=!!s.cfg.mini;
+    document.body.classList.toggle('mini',!!s.cfg.mini);
+  }
+  if(s.conn!=null){$('connTxt').innerHTML=s.conn?'<span class="dot on"></span>已连接 '+(s.me?esc(s.me):''):'<span class="dot"></span>未连接'}
+  if(s.pool){$('pIdle').textContent=(s.pool.idle!=null)?s.pool.idle:'-';
+    $('pLeased').textContent=(s.pool.leased!=null)?s.pool.leased:'-';
+    $('pWin').textContent=(s.pool.activeWindows!=null)?s.pool.activeWindows:'-'}
+  if(s.stats){$('sTaken').textContent=s.stats.taken||0;$('sOk').textContent=s.stats.ok||0;
+    $('sRun').textContent=s.stats.running?(s.stats.resting?'休息中':'运行'):'停止';
+    $('sRest').textContent=s.cfg&&s.cfg.rest?'开':'关';
+    $('btnRun').textContent=s.stats.running?'⏸ 停止循环':'▶ 开始循环'}
+  var tn=$('taskNow');
+  if(s.task){tn.style.display='block';tn.textContent='当前单 #'+s.task.id+' ['+(s.task.acct||'')+'] item '+(s.task.itemId||'')+' · '+(s.task.stage||'')}
+  else{tn.style.display='none'}
+};
+
+/* JS → 原生 */
+window.cmd=function(name,extra){
+  var data={};
+  ['server','user','pass','pid','gapMin','gapMax','restEvery','restSec','autoTake','rest','mini'].forEach(function(k){
+    var el=$(k);if(!el)return;
+    data[k]=(el.type==='checkbox')?el.checked:el.value;
+  });
+  try{window.webkit.messageHandlers.ahaCmd.postMessage({cmd:name,data:data,extra:extra||null})}catch(e){log('原生桥不可用：'+e,'e')}
+};
+/* 兼容旧调用点 */
+window.cmdSave=function(){cmd('save')};
+
+cmd('get');
+log('AHA 面板已载入（app 内悬浮窗）','s');
+})();
+</script>
+</body>
+</html>
