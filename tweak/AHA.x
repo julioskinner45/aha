@@ -1,4 +1,4 @@
-// AHA.x — Shopee app 内采集客户端 v0.4.0（敞口登录 + 大按钮合一 UI）
+// AHA.x — Shopee app 内采集客户端 v0.5.0（App 内路由导航 + 键盘完成条 + 休息折叠）
 //
 // 采集方式（Ajie 同款，不再用 NSURLProtocol——后台会话挂自定义协议会直接崩）：
 //   hook -[NSURLSession dataTaskWithRequest:completionHandler:] 与
@@ -24,6 +24,7 @@
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <objc/message.h>
 
 static NSString *const kAhaCfgKey = @"aha_cfg_v2";
 static NSString *const kPdpMark   = @"/api/v4/pdp/";
@@ -188,6 +189,122 @@ static NSURLSession *AhaSession(NSURLSessionConfiguration *cfg) {
   static AHATrustDelegate *td; static dispatch_once_t once;
   dispatch_once(&once, ^{ td = [[AHATrustDelegate alloc] init]; });
   return [NSURLSession sessionWithConfiguration:cfg delegate:td delegateQueue:nil];
+}
+
+#pragma mark - App 内路由导航（Ajie 实证做法：Shopee 自带 SHPNavigator，绝不跳出 app）
+
+// 找 Shopee 自己窗口的当前 VC（跳过我们的悬浮窗）
+static UIViewController *ahaTopVC(void) {
+  UIViewController *fallback = nil;
+  for (UIWindow *w in [UIApplication sharedApplication].windows) {
+    if (gUI && w == gUI.win) continue;
+    UIViewController *vc = w.rootViewController;
+    if (!vc) continue;
+    if (!fallback) fallback = vc;
+    if (w.isKeyWindow) {
+      while (vc.presentedViewController) vc = vc.presentedViewController;
+      if ([vc isKindOfClass:[UINavigationController class]]) {
+        UIViewController *t = [(UINavigationController *)vc topViewController];
+        if (t) vc = t;
+      }
+      return vc;
+    }
+  }
+  return fallback;
+}
+
+// 找 Shopee 自己的导航控制器（收弹层/控栈深用）
+static UINavigationController *ahaShopeeNav(void) {
+  for (UIWindow *w in [UIApplication sharedApplication].windows) {
+    if (gUI && w == gUI.win) continue;
+    UIViewController *vc = w.rootViewController;
+    if (!vc) continue;
+    if ([vc isKindOfClass:[UITabBarController class]])
+      vc = [(UITabBarController *)vc selectedViewController];
+    if ([vc isKindOfClass:[UINavigationController class]])
+      return (UINavigationController *)vc;
+  }
+  return nil;
+}
+
+// navigateOption/pushOption/completion 三个参数只敢传对象或标量（按 0/nil），结构体参数直接放弃该选择器
+static BOOL ahaArgTypeOk(NSMethodSignature *sig, NSUInteger idx) {
+  if (sig.numberOfArguments <= idx) return NO;
+  const char *t = [sig getArgumentTypeAtIndex:idx];
+  if (!t || !t[0]) return NO;
+  switch (t[0]) {
+    case '@': case 'q': case 'Q': case 'i': case 'I': case 'l': case 'L':
+    case 's': case 'S': case 'c': case 'C': case 'Z': case 'B':
+      return YES;
+    default:
+      return NO;
+  }
+}
+
+// Ajie 的路由链（从它 dylib 里挖的候选）：SHPNavigator 单例 + SHPNavigatorNavigationPath
+// 路径串 rn/PRODUCT_PAGE?item_id=X&shop_id=Y —— Shopee 内部 RN 页面路由，页面在 app 里 push
+static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
+  Class navCls  = NSClassFromString(@"SHPNavigator");
+  Class pathCls = NSClassFromString(@"SHPNavigatorNavigationPath");
+  if (!navCls || !pathCls) return NO;
+  @try {
+    id nav = nil;
+    for (NSString *m in @[@"sharedInstance", @"sharedManager", @"defaultManager", @"manager",
+                          @"shared", @"navigator", @"navigationManager", @"navigatorManager"]) {
+      SEL s = NSSelectorFromString(m);
+      if ([navCls respondsToSelector:s]) {
+        nav = ((id(*)(id, SEL))objc_msgSend)(navCls, s);
+        if (nav) break;
+      }
+    }
+    if (!nav) return NO;
+
+    NSString *route = [NSString stringWithFormat:@"rn/PRODUCT_PAGE?item_id=%@&shop_id=%@", itemId, shopId];
+    id path = nil;
+    id (*msgObj)(id, SEL, id) = (id(*)(id, SEL, id))objc_msgSend;
+    for (NSString *m in @[@"pathWithString:", @"navigationPathWithString:", @"pathWithRoute:", @"pathWithAppRL:"]) {
+      SEL s = NSSelectorFromString(m);
+      if ([pathCls respondsToSelector:s]) { path = msgObj(pathCls, s, route); if (path) break; }
+    }
+    if (!path) {
+      id p = [[pathCls alloc] init];
+      for (NSString *m in @[@"initWithString:", @"initWithRoute:", @"initWithAppRL:"]) {
+        SEL s = NSSelectorFromString(m);
+        if ([p respondsToSelector:s]) { path = msgObj(p, s, route); break; }
+      }
+      if (!path) return NO;
+    }
+
+    UIViewController *vc = ahaTopVC();
+    if (!vc) return NO;
+
+    // 防堆叠黑屏：失败商品页会弹「OK」白板弹层、还会一层层 push，
+    // 先收掉弹层；导航栈超过 2 层（根+1 商品页）就回根再跳，栈内不超限就从当前页直接跳
+    UINavigationController *nc = ahaShopeeNav();
+    if (nc) {
+      if (nc.presentedViewController) [nc dismissViewControllerAnimated:NO completion:nil];
+      if (nc.viewControllers.count > 2) [nc popToRootViewControllerAnimated:NO];
+      UIViewController *top = nc.topViewController;
+      if (top) vc = top;
+    } else if (vc.presentedViewController) {
+      [vc dismissViewControllerAnimated:NO completion:nil];
+    }
+
+    for (NSString *m in @[@"navigateFromViewController:destinationPath:navigateOption:completion:",
+                          @"pushFromViewController:destinationPath:pushOption:completion:"]) {
+      SEL sel = NSSelectorFromString(m);
+      if (![nav respondsToSelector:sel]) continue;
+      NSMethodSignature *sig = [navCls instanceMethodSignatureForSelector:sel];
+      if (!ahaArgTypeOk(sig, 2) || !ahaArgTypeOk(sig, 3) || !ahaArgTypeOk(sig, 4)) continue;
+      void (*fn)(id, SEL, id, id, id, id) = (void (*)(id, SEL, id, id, id, id))objc_msgSend;
+      fn(nav, sel, vc, path, nil, nil);
+      return YES;
+    }
+  } @catch (NSException *e) {
+    ahaLog(@"w", [NSString stringWithFormat:@"App 内导航异常：%@", e.reason]);
+    return NO;
+  }
+  return NO;
 }
 
 #pragma mark - 观察钩子（Ajie 同款：包 completionHandler，不碰 protocolClasses）
@@ -399,12 +516,12 @@ static void ahaLog(NSString *lv, NSString *msg) {
 - (void)takeOnce {
   dispatch_async(self.q, ^{
     if (!self.running || !self.token) { ahaRefreshUI(); return; }
-    // 休息窗口（每 restEvery 单歇 restSec 秒）
+    // 休息窗口（每 restEvery 单歇 restSec 秒；两项都设了才生效）
     NSInteger every = [self num:@"restEvery" def:0];
-    if (every > 0 && self.taken > 0 && (self.taken % every) == 0 && !self.resting) {
-      NSInteger rs = [self num:@"restSec" def:60];
+    NSInteger rs = [self num:@"restSec" def:0];
+    if (every > 0 && rs > 0 && self.taken > 0 && (self.taken % every) == 0 && !self.resting) {
       self.resting = YES;
-      ahaLog(@"w", [NSString stringWithFormat:@"已领 %ld 单，休息 %ld 秒", (long)self.taken, (long)rs]);
+      ahaLog(@"w", [NSString stringWithFormat:@"已领 %ld 单，休息 %ld 分钟", (long)self.taken, (long)(rs / 60)]);
       ahaRefreshUI();
       dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(rs * NSEC_PER_SEC)),
           self.q, ^{ self.resting = NO; ahaLog(@"s", @"休息结束"); [self takeOnce]; });
@@ -451,9 +568,16 @@ static void ahaLog(NSString *lv, NSString *msg) {
   ahaLog(@"s", [NSString stringWithFormat:@"领到单 #%@ [%@] item %@ shop %@", taskId, acct, itemId, shopId]);
   ahaRefreshUI();
 
-  NSString *pageUrl = [NSString stringWithFormat:@"https://shopee.tw/product/%@/%@", shopId, itemId];
+  // App 内路由导航（Ajie 同款：SHPNavigator push 商品页，不跳出 app）；
+  // 路由没打通才退回网页兜底并明确提示
   dispatch_async(dispatch_get_main_queue(), ^{
-    [[UIApplication sharedApplication] openURL:[NSURL URLWithString:pageUrl]
+    if (ahaNavInApp(shopId, itemId)) {
+      ahaLog(@"i", @"已在 app 内打开商品页");
+      return;
+    }
+    ahaLog(@"w", @"App 内路由不可用，回退网页打开（请把日志发我）");
+    [[UIApplication sharedApplication] openURL:
+        [NSURL URLWithString:[NSString stringWithFormat:@"https://shopee.tw/product/%@/%@", shopId, itemId]]
         options:@{} completionHandler:nil];
   });
 
@@ -629,10 +753,13 @@ static void ahaTap(UIControl *c, void (^blk)(void)) {
 @property(nonatomic, strong) UIView *header, *mini;
 @property(nonatomic, strong) UILabel *ttl, *statusLabel, *taskLabel, *counterLabel, *miniInfo, *rh;
 @property(nonatomic, strong) UITextField *userField, *gapField, *restEveryField, *restSecField;
+@property(nonatomic, strong) UIView *restRow;
 @property(nonatomic, strong) UITextView *logView;
-@property(nonatomic, strong) UIButton *gearBtn, *miniBtn, *startBtn, *resetBtn;
+@property(nonatomic, strong) UIButton *gearBtn, *miniBtn, *startBtn, *resetBtn, *restBtn;
 - (void)boot;
 - (void)layoutPanel;
+- (void)toggleRest;
+- (void)updateRestTitle;
 @end
 
 @implementation AHAUI
@@ -658,6 +785,25 @@ static UITextField *AhaField(NSString *ph, NSString *icon) {
   f.leftViewMode = UITextFieldViewModeAlways;
   f.autocorrectionType = UITextAutocorrectionTypeNo;
   f.autocapitalizationType = UITextAutocapitalizationTypeNone;
+
+  // 键盘上方「完成」工具条：数字键盘/无收起键的键盘也能一键收回
+  CGFloat bw = [UIScreen mainScreen].bounds.size.width;
+  UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, bw, 44)];
+  bar.backgroundColor = AhaColor(28, 34, 48, 1);
+  UIButton *done = [UIButton buttonWithType:UIButtonTypeCustom];
+  done.frame = CGRectMake(bw - 80, 5, 72, 34);
+  [done setTitle:@"完成 ▾" forState:UIControlStateNormal];
+  done.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+  [done setTitleColor:AhaColor(120, 200, 255, 1) forState:UIControlStateNormal];
+  ahaTap(done, ^{
+    [[UIApplication sharedApplication] sendAction:@selector(resignFirstResponder)
+        to:nil from:nil forEvent:nil];
+  });
+  [bar addSubview:done];
+  UIView *ln = [[UIView alloc] initWithFrame:CGRectMake(0, 0, bw, 0.5)];
+  ln.backgroundColor = AhaColor(255, 255, 255, 0.15);
+  [bar addSubview:ln];
+  f.inputAccessoryView = bar;
   return f;
 }
 
@@ -726,18 +872,23 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   [p addSubview:self.counterLabel];
   [p addSubview:self.taskLabel];
 
-  // 账号（敞口：无密码）+ 间隔/休息
+  // 账号（敞口：无密码）+ 间隔；休息默认折叠成一个按钮，点开展开
   self.userField = AhaField(@"账号（中枢后台账号）", @"👤");
-  self.gapField        = AhaField(@"间隔秒 0-0", @"⏱");
-  self.restEveryField  = AhaField(@"每N单休", @"☕");
-  self.restSecField    = AhaField(@"休秒", @"⏸");
+  self.gapField = AhaField(@"间隔秒 0-0", @"⏱");
   self.gapField.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
-  self.restEveryField.keyboardType = UIKeyboardTypeNumberPad;
-  self.restSecField.keyboardType = UIKeyboardTypeNumberPad;
   [p addSubview:self.userField];
   [p addSubview:self.gapField];
-  [p addSubview:self.restEveryField];
-  [p addSubview:self.restSecField];
+  self.restBtn = AhaBtn(@"☕ 休息：未开启", AhaColor(60, 66, 80, 1), 13);
+  [p addSubview:self.restBtn];
+  self.restRow = [[UIView alloc] initWithFrame:CGRectZero];
+  self.restEveryField = AhaField(@"做N单（0=不歇）", @"☕");
+  self.restSecField   = AhaField(@"休分钟", @"⏸");
+  self.restEveryField.keyboardType = UIKeyboardTypeNumberPad;
+  self.restSecField.keyboardType = UIKeyboardTypeNumberPad;
+  [self.restRow addSubview:self.restEveryField];
+  [self.restRow addSubview:self.restSecField];
+  self.restRow.hidden = YES;
+  [p addSubview:self.restRow];
 
   // 一个大按钮 = 开始（自动登录）/ 停止，同一按钮；旁边小清零
   self.startBtn = AhaBtn(@"▶ 开始采集", AhaColor(34, 170, 90, 1), 18);
@@ -788,6 +939,7 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
 
   // 交互
   ahaTap(self.gearBtn,  ^{ [[AHAUI shared] showSettings]; });
+  ahaTap(self.restBtn,  ^{ [[AHAUI shared] toggleRest]; });
   ahaTap(self.miniBtn,  ^{ [[AHAUI shared] collapse:YES]; });
   ahaTap(self.startBtn, ^{
     [self.panel endEditing:YES];
@@ -796,12 +948,15 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   });
   ahaTap(self.resetBtn, ^{ [self.panel endEditing:YES]; [gPool resetCounters]; ahaLog(@"i", @"计数已清零"); });
 
-  // 输入框预填（间隔默认 0-0）+ 失焦保存
+  // 输入框预填（间隔默认 0-0；休息按分钟显示，内部存秒）+ 失焦保存
   self.userField.text = gPool.cfg[@"user"] ?: @"";
   NSInteger lo = [gPool num:@"gapMin" def:0], hi = [gPool num:@"gapMax" def:0];
   self.gapField.text = [NSString stringWithFormat:@"%ld-%ld", (long)lo, (long)hi];
   self.restEveryField.text = [NSString stringWithFormat:@"%ld", (long)[gPool num:@"restEvery" def:0]];
-  self.restSecField.text   = [NSString stringWithFormat:@"%ld", (long)[gPool num:@"restSec" def:60]];
+  NSInteger mins0 = ([gPool num:@"restSec" def:0]) / 60;
+  self.restSecField.text = [NSString stringWithFormat:@"%ld", (long)mins0];
+  if ([gPool num:@"restEvery" def:0] > 0) self.restRow.hidden = NO;
+  [self updateRestTitle];
   for (UITextField *f in @[self.userField, self.gapField, self.restEveryField, self.restSecField])
     [f addTarget:self action:@selector(fieldsChanged) forControlEvents:UIControlEventEditingDidEnd];
 
@@ -828,9 +983,26 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   gPool.cfg[@"gapMin"] = @(lo);
   gPool.cfg[@"gapMax"] = @(hi);
   gPool.cfg[@"restEvery"] = @(MAX([self.restEveryField.text integerValue], 0));
-  gPool.cfg[@"restSec"]   = @(MAX([self.restSecField.text integerValue], 0));
+  NSInteger mins = MAX([self.restSecField.text integerValue], 0);
+  gPool.cfg[@"restSec"] = @(mins * 60);      // 面板按分钟，内部按秒
   [gPool saveCfg];
+  [self updateRestTitle];
   ahaLog(@"i", @"配置已保存（本机）");
+}
+
+// 休息折叠按钮：点开/收起「做N单休M分钟」
+- (void)toggleRest {
+  self.restRow.hidden = !self.restRow.hidden;
+  [self updateRestTitle];
+  [self layoutPanel];
+}
+- (void)updateRestTitle {
+  NSInteger every = MAX([self.restEveryField.text integerValue], 0);
+  NSInteger mins  = MAX([self.restSecField.text integerValue], 0);
+  NSString *t = every > 0
+      ? [NSString stringWithFormat:@"☕ 休息：每 %ld 单休 %ld 分钟", (long)every, (long)mins]
+      : @"☕ 休息：未开启";
+  [self.restBtn setTitle:t forState:UIControlStateNormal];
 }
 
 - (void)showSettings {
@@ -884,13 +1056,20 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   self.counterLabel.frame = CGRectMake(12, 70, w - 24, 30);
   self.taskLabel.frame    = CGRectMake(12, 102, w - 24, 16);
   self.userField.frame = CGRectMake(12, 122, w - 24, 34);
-  CGFloat fw = (w - 12 * 2 - 2 * 6) / 3;
-  self.gapField.frame       = CGRectMake(12,          162, fw, 32);
-  self.restEveryField.frame = CGRectMake(12 + fw + 6,  162, fw, 32);
-  self.restSecField.frame   = CGRectMake(12 + (fw + 6) * 2, 162, fw, 32);
-  self.startBtn.frame = CGRectMake(12, 200, w - 12 * 2 - 52 - 8, 46);
-  self.resetBtn.frame = CGRectMake(w - 12 - 52, 200, 52, 46);
-  self.logView.frame  = CGRectMake(12, 254, w - 24, h - 254 - 14);
+  CGFloat fw = (w - 12 * 2 - 8) / 2;
+  self.gapField.frame = CGRectMake(12, 162, fw, 32);
+  self.restBtn.frame  = CGRectMake(12 + fw + 8, 162, fw, 32);
+  CGFloat y = 200;
+  if (!self.restRow.hidden) {                 // 休息展开：两个框 + 下推内容
+    self.restRow.frame = CGRectMake(12, y, w - 24, 32);
+    self.restEveryField.frame = CGRectMake(0, 0, fw, 32);
+    self.restSecField.frame   = CGRectMake(fw + 8, 0, fw, 32);
+    y += 40;
+  }
+  self.startBtn.frame = CGRectMake(12, y, w - 12 * 2 - 52 - 8, 46);
+  self.resetBtn.frame = CGRectMake(w - 12 - 52, y, 52, 46);
+  y += 54;
+  self.logView.frame  = CGRectMake(12, y, w - 24, h - y - 14);
   self.rh.frame       = CGRectMake(w - 20, h - 20, 20, 20);
 }
 
