@@ -25,8 +25,14 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/message.h>
+#import <signal.h>
+#import <execinfo.h>
+#import <fcntl.h>
+#import <unistd.h>
+#import <stdio.h>
 
-static NSString *const kAhaCfgKey = @"aha_cfg_v2";
+static NSString *const kAhaCfgKey  = @"aha_cfg_v2";
+static NSString *const kAhaCrashKey = @"aha_last_crash_v1";
 static NSString *const kPdpMark   = @"/api/v4/pdp/";
 static NSString *const kGetPcMark = @"/api/v4/pdp/get_pc";
 // get_pc 直取模板（Ajie 同款：display_model_id=0 / model_selection_logic=3 / tz 480）
@@ -503,6 +509,7 @@ static void ahaRiskAlertShow(void) {
       [NSCharacterSet whitespaceCharacterSet]];
   if (u.length == 0) { ahaLog(@"w", @"先填账号"); ahaRefreshUI(); return; }
   self.taskLine = @"";
+  ahaLog(@"i", [NSString stringWithFormat:@"[%@] 正在登录 %@ …", u, self.base]);
   [self api:@"/api/pool/login" method:@"POST"
       body:@{ @"name": u }
       done:^(NSDictionary *j, NSError *e) {
@@ -590,7 +597,7 @@ static void ahaRiskAlertShow(void) {
         done:^(NSDictionary *j, NSError *e) {
       dispatch_async(self.q, ^{
         if (e) {
-          ahaLog(@"e", [NSString stringWithFormat:@"领单失败：%@", e.localizedDescription]);
+          ahaLog(@"e", [NSString stringWithFormat:@"领单请求失败：%@", e.localizedDescription]);
           self.taskLine = @"";
           ahaRefreshUI();
           [self scheduleNext:5];
@@ -602,12 +609,21 @@ static void ahaRiskAlertShow(void) {
               ? [j[@"waitMs"] doubleValue] / 1000.0 : 0;
           if (wait < 1) wait = [self randomGap];
           self.taskLine = @"";
+          ahaLog(@"i", [NSString stringWithFormat:@"池子暂无单，%.0f 秒后再领", wait]);
           ahaRefreshUI();
           [self scheduleNext:wait];
           return;
         }
         self.taken++;
-        [self handleTask:t];
+        @try { [self handleTask:t]; } @catch (NSException *e) {
+          ahaLog(@"e", [NSString stringWithFormat:@"任务处理异常已拦截：%@ — 任务回池", e.reason]);
+          self.taskLine = @"";
+          ahaRefreshUI();
+          [self api:@"/api/pool/report" method:@"POST"
+              body:@{ @"taskId": [NSString stringWithFormat:@"%@", t[@"id"] ?: @""],
+                      @"profileId": self.cfg[@"pid"] ?: @"", @"status": @"skip" } done:nil];
+          [self scheduleNext:5];
+        }
       });
     }];
   });
@@ -628,9 +644,12 @@ static void ahaRiskAlertShow(void) {
   // 路由没打通才退回网页兜底并明确提示
   dispatch_async(dispatch_get_main_queue(), ^{
     BOOL opened = NO;
-    @try { opened = ahaNavInApp(shopId, itemId); } @catch (__unused NSException *e) { opened = NO; }
+    @try { opened = ahaNavInApp(shopId, itemId); } @catch (NSException *e) {
+      ahaLog(@"e", [NSString stringWithFormat:@"导航异常已拦截：%@", e.reason]);
+      opened = NO;
+    }
     if (opened) {
-      ahaLog(@"i", @"已在 app 内打开商品页");
+      ahaLog(@"i", [NSString stringWithFormat:@"已打开商品页 #%@（app 内路由）", itemId]);
       return;
     }
     ahaLog(@"w", @"App 内路由不可用，回退网页打开（请把日志发我）");
@@ -648,9 +667,12 @@ static void ahaRiskAlertShow(void) {
     for (int i = 0; i < 40 && !body; i++) {
       [NSThread sleepForTimeInterval:0.5];
       body = [[AHACapture shared] bodyForShop:shopId item:itemId];
+      if (i == 19 && !body)
+        ahaLog(@"i", [NSString stringWithFormat:@"#%@ 商品页开了但 10 秒还没等到回包，继续等…", taskId]);
     }
     NSString *via = @"app截包";
     if (!body) {
+      ahaLog(@"i", [NSString stringWithFormat:@"#%@ 没等到 app 回包，Direct PDP 兜底直调…", taskId]);
       body = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
       via = @"DirectPDP";
     }
@@ -694,6 +716,10 @@ static void ahaRiskAlertShow(void) {
       NSHTTPURLResponse *hr = [r isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)r : nil;
       if (hr.statusCode == 200)
         out = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+      else
+        ahaLog(@"w", [NSString stringWithFormat:@"Direct PDP 回 HTTP %ld", (long)hr.statusCode]);
+    } else if (e) {
+      ahaLog(@"w", [NSString stringWithFormat:@"Direct PDP 网络错误：%@", e.localizedDescription]);
     }
     dispatch_semaphore_signal(sem);
   }] resume];
@@ -723,16 +749,22 @@ static void ahaRiskAlertShow(void) {
     [[sess dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
       dispatch_async(self.q, ^{
         BOOL ok = NO;
+        NSString *codeTxt = @"无回包";
         if (!e && d) {
           id o = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
           id code = [o isKindOfClass:[NSDictionary class]] ? (o[@"code"] ?: [o valueForKeyPath:@"data.code"]) : nil;
           ok = [code isEqual:@200] || [code isEqual:@(200)];
+          codeTxt = [NSString stringWithFormat:@"%@", code ?: @"格式异常"];
         }
+        ahaLog(ok ? @"s" : @"i",
+            [NSString stringWithFormat:@"#%@ 聚星直传%@", taskId,
+              ok ? @"成功" : [NSString stringWithFormat:@"失败(code=%@)，转中枢代交", codeTxt]]);
         if (ok) [self markOk:taskId via:@"聚星直传"];
         else [self hubSubmit:taskId taskUrl:taskUrl result:result];
       });
     }] resume];
   } else {
+    ahaLog(@"i", [NSString stringWithFormat:@"#%@ 任务无聚星直传参数，走中枢代交", taskId]);
     [self hubSubmit:taskId taskUrl:taskUrl result:result];
   }
 }
@@ -1229,12 +1261,91 @@ static void ahaRefreshUI(void) {
 
 #pragma mark - 入口（显式自定义构造函数必须手动初始化钩子组 —— v0.2.0 的血坑）
 
+// —— 崩溃记录器：闪退时把根因写进 NSUserDefaults，下次启动面板日志直接显示 ——
+// 目的：不再猜闪退原因。NSException（如 unrecognized selector / 参数非法）走
+// NSSetUncaughtExceptionHandler 能拿到完整 reason + 调用栈；段错误类（SIGSEGV/
+// SIGABRT/SIGBUS/SIGILL/SIGTRAP）走 signal 处理器记信号类型。
+static void ahaCrashRecord(NSString *tag, NSString *detail) {
+  @try {
+    NSString *prev = [[NSUserDefaults standardUserDefaults] stringForKey:kAhaCrashKey];
+    NSString *line = [NSString stringWithFormat:@"%@ %@（上次）",
+        [NSDateFormatter localizedStringFromDate:[NSDate date]
+                                      dateFormatterStyle:NSDateFormatterShortStyle
+                                      timeFormatterStyle:NSDateFormatterMediumStyle], detail ?: tag];
+    // 只留最近 3 条，防无限膨胀
+    NSMutableArray *arr = [prev ? [prev componentsSeparatedByString:@"\n----------\n"] : @[]
+                            mutableCopy];
+    [arr addObject:line];
+    while (arr.count > 3) [arr removeObjectAtIndex:0];
+    [[NSUserDefaults standardUserDefaults] setObject:
+        [arr componentsJoinedByString:@"\n----------\n"] forKey:kAhaCrashKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+  } @catch (__unused NSException *e) { /* 崩溃记录失败就算了 */ }
+}
+
+static void ahaUncaughtHandler(NSException *exc) {
+  ahaCrashRecord(@"exception",
+      [NSString stringWithFormat:@"[未捕获异常] %@: %@\n堆栈:\n%@",
+          exc.name, exc.reason, exc.callStackSymbols]);
+}
+
+static char gAhaSigPath[512];   // 信号处理器里只做 write，走安全路径
+static void ahaSignalHandler(int sig) {
+  const char *msg = "[AHA 段错误类崩溃] ";
+  char buf[80];
+  int fd = open(gAhaSigPath[0] ? gAhaSigPath : "/tmp/aha_crash.log",
+                O_WRONLY | O_CREAT | O_APPEND, 0644);
+  if (fd >= 0) {
+    int n = snprintf(buf, sizeof(buf), "%s信号=%d（系统直接终止进程）\n", msg, sig);
+    if (n > 0) write(fd, buf, (size_t)n);
+    close(fd);
+  }
+  signal(sig, SIG_DFL);   // 恢复默认处理，让系统正常终止
+  raise(sig);
+}
+
+static void ahaInstallCrashCatcher(void) {
+  NSString *p = [NSString stringWithFormat:@"%@/aha_crash.log", NSHomeDirectory()];
+  strncpy(gAhaSigPath, p.fileSystemRepresentation, sizeof(gAhaSigPath) - 1);
+  NSSetUncaughtExceptionHandler(&ahaUncaughtHandler);
+  signal(SIGABRT, &ahaSignalHandler);
+  signal(SIGSEGV, &ahaSignalHandler);
+  signal(SIGBUS,  &ahaSignalHandler);
+  signal(SIGILL,  &ahaSignalHandler);
+  signal(SIGTRAP, &ahaSignalHandler);
+}
+
+// 启动时读出上次崩溃记录，写进面板日志
+static void ahaReportLastCrash(void) {
+  NSString *rec = [[NSUserDefaults standardUserDefaults] stringForKey:kAhaCrashKey];
+  NSString *sig = nil;
+  if (gAhaSigPath[0]) {
+    NSData *d = [NSData dataWithContentsOfFile:@(gAhaSigPath)];
+    if (d.length) {
+      sig = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+      [[NSFileManager defaultManager] removeItemAtPath:@(gAhaSigPath) error:nil];  // 读后即清
+    }
+  }
+  if (sig.length) {
+    ahaLog(@"e", [NSString stringWithFormat:@"⚠️ 上次崩溃（信号级）：%@", sig]);
+    ahaLog(@"e", @"请把这段日志截图发给开发者");
+  }
+  if (rec.length) {
+    for (NSString *l in [rec componentsSeparatedByString:@"\n"]) ahaLog(@"e", l);
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:kAhaCrashKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    ahaLog(@"e", @"↑ 上次闪退的根因已捕获，截图发给开发者");
+  }
+}
+
 %ctor {
+  ahaInstallCrashCatcher();  // 最先装，任何闪退都要留下证据
   %init(_ungrouped);         // 没这行，所有钩子都不生效（v0.2.0 血坑）
   gPool = [AHAPool shared];
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
       dispatch_get_main_queue(), ^{
     gUI = [AHAUI shared];
     [gUI boot];
+    ahaReportLastCrash();    // 面板起来后第一时间汇报上次闪退根因
   });
 }
