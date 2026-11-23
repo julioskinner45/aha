@@ -32,8 +32,8 @@ jobs:
 
       - name: Install Theos + sdks (git 协议，绕开 API 限流)
         run: |
-          git clone --depth 1 --recursive https://github.com/theos/theos.git "$THEOS"
-          ls "$THEOS" | head
+          git clone --depth 1 https://github.com/theos/theos.git "$THEOS"
+          git clone --depth 1 https://github.com/theos/sdks.git "$THEOS/sdks"
           ls "$THEOS/sdks" | grep -i iphone | head -3
 
       - name: Install iOS toolchain (clang for apple targets)
