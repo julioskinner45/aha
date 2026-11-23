@@ -1,0 +1,17 @@
+name: Test Ubuntu runner
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe
+        run: |
+          echo "ubuntu alive: $(uname -a)"
+          clang --version | head -1 || true
+          python3 --version
