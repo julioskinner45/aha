@@ -43,7 +43,7 @@
 #import <stdio.h>
 
 // MSHookMessageEx（substrate）：Ajie delegate 动态 swizzle 同款，不 import substrate.h 直接声明
-extern "C" void MSHookMessageEx(Class _class, SEL message, IMP hook, IMP *result);
+extern void MSHookMessageEx(Class _class, SEL message, IMP hook, IMP *result);
 
 static NSString *const kAhaCfgKey  = @"aha_cfg_v2";
 static NSString *const kAhaCrashKey = @"aha_last_crash_v1";
