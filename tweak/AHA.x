@@ -27,7 +27,9 @@ static NSString *const kGetPcMark = @"/api/v4/pdp/get_pc";
 // get_pc 直取模板（Ajie 同款：display_model_id=0 / model_selection_logic=3 / tz 480）
 static NSString *const kGetPcTpl  = @"https://shopee.tw/api/v4/pdp/get_pc?display_model_id=0&item_id=%@&model_selection_logic=3&shop_id=%@&tz_offset_in_minutes=480&detail_level=0";
 
+@class AHAPool;
 @class AHACapture;
+@class AHAPanel;
 @class AHAUI;
 
 static AHAPool *gPool = nil;
@@ -571,7 +573,7 @@ static UIColor *AhaColor(NSInteger r, NSInteger g, NSInteger b, CGFloat a) {
 static void ahaTap(UIControl *c, void (^blk)(void)) {
   AHAActionWrap *w = [[AHAActionWrap alloc] init];
   w.blk = blk;
-  objc_setAssociatedObject(c, w, w, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  objc_setAssociatedObject(c, (__bridge const void *)w, w, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
   [c addTarget:w action:@selector(fire) forControlEvents:UIControlEventTouchUpInside];
 }
 
@@ -584,41 +586,8 @@ static void ahaTap(UIControl *c, void (^blk)(void)) {
 }
 @end
 
-// 面板容器：header 拖动 + 右下角 resize
+// 面板容器：header 拖动 + 右下角 resize（实现放在 AHAUI 接口之后）
 @interface AHAPanel : UIView @end
-@implementation AHAPanel
-- (void)ahaPan:(UIPanGestureRecognizer *)g {
-  static CGPoint origin;
-  if (g.state == UIGestureRecognizerStateBegan) origin = self.center;
-  if (g.state == UIGestureRecognizerStateChanged) {
-    CGPoint t = [g translationInView:self];
-    self.center = CGPointMake(origin.x + t.x, origin.y + t.y);
-  }
-  if (g.state == UIGestureRecognizerStateEnded && gPool) {
-    gPool.cfg[@"panelX"] = @(self.frame.origin.x);
-    gPool.cfg[@"panelY"] = @(self.frame.origin.y);
-    [gPool saveCfg];
-  }
-}
-- (void)ahaResize:(UIPanGestureRecognizer *)g {
-  static CGFloat w0, h0;
-  if (g.state == UIGestureRecognizerStateBegan) { w0 = self.frame.size.width; h0 = self.frame.size.height; }
-  if (g.state == UIGestureRecognizerStateChanged) {
-    CGPoint t = [g translationInView:self];
-    CGFloat scrW = [UIScreen mainScreen].bounds.size.width;
-    CGFloat scrH = [UIScreen mainScreen].bounds.size.height;
-    CGFloat w = MIN(MAX(w0 + t.x, 260), scrW - 20);
-    CGFloat h = MIN(MAX(h0 + t.y, 300), scrH - 40);
-    self.frame = CGRectMake(self.frame.origin.x, self.frame.origin.y, w, h);
-    if (gUI) [gUI layoutPanel];
-  }
-  if (g.state == UIGestureRecognizerStateEnded && gPool) {
-    gPool.cfg[@"panelW"] = @(self.frame.size.width);
-    gPool.cfg[@"panelH"] = @(self.frame.size.height);
-    [gPool saveCfg];
-  }
-}
-@end
 
 @interface AHAUI : NSObject
 @property(nonatomic, strong) AHAPassthroughWindow *win;
@@ -920,6 +889,42 @@ static void ahaRefreshUI(void) {
     if (gUI) [gUI refresh];
   });
 }
+
+#pragma mark - 面板容器实现（要在 AHAUI 接口之后才能调 layoutPanel）
+
+@implementation AHAPanel
+- (void)ahaPan:(UIPanGestureRecognizer *)g {
+  static CGPoint origin;
+  if (g.state == UIGestureRecognizerStateBegan) origin = self.center;
+  if (g.state == UIGestureRecognizerStateChanged) {
+    CGPoint t = [g translationInView:self];
+    self.center = CGPointMake(origin.x + t.x, origin.y + t.y);
+  }
+  if (g.state == UIGestureRecognizerStateEnded && gPool) {
+    gPool.cfg[@"panelX"] = @(self.frame.origin.x);
+    gPool.cfg[@"panelY"] = @(self.frame.origin.y);
+    [gPool saveCfg];
+  }
+}
+- (void)ahaResize:(UIPanGestureRecognizer *)g {
+  static CGFloat w0, h0;
+  if (g.state == UIGestureRecognizerStateBegan) { w0 = self.frame.size.width; h0 = self.frame.size.height; }
+  if (g.state == UIGestureRecognizerStateChanged) {
+    CGPoint t = [g translationInView:self];
+    CGFloat scrW = [UIScreen mainScreen].bounds.size.width;
+    CGFloat scrH = [UIScreen mainScreen].bounds.size.height;
+    CGFloat w = MIN(MAX(w0 + t.x, 260), scrW - 20);
+    CGFloat h = MIN(MAX(h0 + t.y, 300), scrH - 40);
+    self.frame = CGRectMake(self.frame.origin.x, self.frame.origin.y, w, h);
+    if (gUI) [gUI layoutPanel];
+  }
+  if (g.state == UIGestureRecognizerStateEnded && gPool) {
+    gPool.cfg[@"panelW"] = @(self.frame.size.width);
+    gPool.cfg[@"panelH"] = @(self.frame.size.height);
+    [gPool saveCfg];
+  }
+}
+@end
 
 #pragma mark - 入口（显式自定义构造函数必须手动初始化钩子组 —— v0.2.0 的血坑）
 
