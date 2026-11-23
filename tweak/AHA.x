@@ -361,6 +361,21 @@ static UIViewController *ahaResolvedTopVC(void) {
   return vc;
 }
 
+// —— Ajie routeBackOnce 复刻：manager 级回退（它 dylib 里的 8 个回退选择器，goBack 优先）——
+// Shopee 的页面栈不一定是纯 UINavigationController，manager 级回退才是它原生认的「返回」
+static void ahaRouteBackOnce(void) {
+  id nav = ahaResolveManager();
+  if (!nav) return;
+  for (NSString *m in @[@"goBack", @"navigateBack", @"back", @"popViewController",
+                        @"pop", @"goBackAnimated:", @"navigateBackAnimated:", @"popViewControllerAnimated:"]) {
+    SEL s = NSSelectorFromString(m);
+    if (![nav respondsToSelector:s]) continue;
+    // 带参的回退选择器（Animated: 系列）补一个 NO，避免裸调吃到垃圾参数
+    NSArray *args = [m hasSuffix:@":"] ? @[@NO] : @[];
+    if (ahaInvoke(nav, s, args, @"routeBack")) return;
+  }
+}
+
 // —— 路径对象（Ajie buildNavigationPathObjectForRoute: 复刻，v0.5.5 已对齐）——
 static id ahaBuildPath(NSString *route) {
   Class pathCls = NSClassFromString(@"SHPNavigatorNavigationPath");
@@ -744,22 +759,49 @@ static void ahaRiskAlertShow(void) {
   NSString *shopId   = [NSString stringWithFormat:@"%@", t[@"shopId"] ?: @""];
   NSString *itemId   = [NSString stringWithFormat:@"%@", t[@"itemId"] ?: @""];
   NSString *acct     = [NSString stringWithFormat:@"%@", t[@"acct"] ?: @""];
+  // 双保险：老版本 hub 入库的任务可能缺 shop/item——taskUrl 里一定有（-i.SHOP.ITEM 或 /product/SHOP/ITEM）
+  if (itemId.length == 0 || shopId.length == 0) {
+    static NSRegularExpression *re; static dispatch_once_t onceT;
+    dispatch_once(&onceT, ^{
+      re = [NSRegularExpression regularExpressionWithPattern:
+            @"/product/(\\d+)/(\\d+)|-i\\.(\\d+)\\.(\\d+)" options:0 error:nil];
+    });
+    if (re && taskUrl.length) {
+      NSTextCheckingResult *m = [re firstMatchInString:taskUrl options:0 range:NSMakeRange(0, taskUrl.length)];
+      if (m) {
+        NSString * (^g)(NSInteger) = ^NSString *(NSInteger i) {
+          NSRange r = [m rangeAtIndex:i];
+          return (r.location != NSNotFound) ? [taskUrl substringWithRange:r] : @"";
+        };
+        if (shopId.length == 0) shopId = g(1).length ? g(1) : g(3);
+        if (itemId.length == 0) itemId = g(2).length ? g(2) : g(4);
+        if (shopId.length && itemId.length)
+          ahaLog(@"i", [NSString stringWithFormat:@"任务缺 shop/item，已从 taskUrl 补解析：shop %@ item %@", shopId, itemId]);
+      }
+    }
+  }
   self.taskLine = [NSString stringWithFormat:@"#%@ [%@] item %@ · 打开商品页", taskId, acct, itemId];
   ahaStep(@"任务:领到单");
   ahaLog(@"s", [NSString stringWithFormat:@"领到单 #%@ [%@] item %@ shop %@", taskId, acct, itemId, shopId]);
   ahaRefreshUI();
 
-  // App 内路由导航（Ajie 同款）：先收弹层回根 → 等 0.4 秒（Ajie 0.35s，不跟回根动画打架）→ 再跳；
-  // 路由没打通才退回网页兜底并明确提示
+  // App 内路由导航（Ajie 全流程）：收弹层 → 栈深回根（manager 级 routeBackOnce 优先）→
+  // 等 0.4 秒（Ajie 0.35s，不跟回根动画打架）→ 路径式导航 → 商品直开兜底；
+  // 全失败不跳 Safari（独立进程抓不到 get_pc），靠 Direct PDP 兜底
   dispatch_async(dispatch_get_main_queue(), ^{
+    // ① 收掉叠出来的弹层——白板「重新載入」就是一层层 present 出来的，先全收
+    UIViewController *top = ahaResolvedTopVC();
+    while (top && top.presentedViewController) {
+      ahaStep(@"导航:收弹层");
+      [top dismissViewControllerAnimated:NO completion:nil];
+    }
+    // ② 栈深超 2 层先回根：Ajie 的 manager 级回退优先，UINavigationController 兜底
     UINavigationController *nc = ahaShopeeNav();
-    if (nc) {
-      if (nc.presentedViewController) [nc dismissViewControllerAnimated:NO completion:nil];
-      if (nc.viewControllers.count > 2) {
-        ahaStep(@"导航:回根");
-        [nc popToRootViewControllerAnimated:NO];
-        ahaLog(@"i", @"栈深超 2 层，先回首页再跳");
-      }
+    if (nc && nc.viewControllers.count > 2) {
+      ahaStep(@"导航:回根");
+      ahaRouteBackOnce();
+      if (nc.viewControllers.count > 2) [nc popToRootViewControllerAnimated:NO];
+      ahaLog(@"i", @"栈深超 2 层，先回首页再跳");
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{
@@ -771,11 +813,9 @@ static void ahaRiskAlertShow(void) {
       }
       ahaStep(@"导航:结束");
       if (opened) {
-        ahaLog(@"i", [NSString stringWithFormat:@"已打开商品页 #%@（app 内路由）", itemId]);
+        ahaLog(@"i", [NSString stringWithFormat:@"已打开商品页 #%@", itemId]);
         return;
       }
-      // v0.5.9：不再跳 Safari——Safari 是独立进程，get_pc 抓不到纯属白跑；
-      // 直接等 Direct PDP 兜底（重放 app 请求头直调 get_pc），拿不到就回池
       ahaLog(@"w", @"App 内路由不可用，靠 Direct PDP 兜底直取数据");
     });
   });
@@ -799,6 +839,13 @@ static void ahaRiskAlertShow(void) {
       body = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
       via = @"DirectPDP";
     }
+    // 白板自清理：这一单走完（成/败都一样），把商品页退掉——
+    // 加载失败的商品页会弹「重新載入」白板，一层层叠下去屏幕就黑了
+    dispatch_async(dispatch_get_main_queue(), ^{
+      UIViewController *top = ahaResolvedTopVC();
+      while (top && top.presentedViewController) [top dismissViewControllerAnimated:NO completion:nil];
+      ahaRouteBackOnce();
+    });
     dispatch_async(self.q, ^{
       if (!body) {
         ahaLog(@"w", @"20 秒没等到商品回包（页面没开/没加载完），任务回池");
