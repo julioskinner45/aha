@@ -578,7 +578,9 @@ static void ahaRiskAlertShow(void) {
   });
   [[sess dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
     id obj = (d && !e) ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
-    done(([obj isKindOfClass:[NSDictionary class]] ? obj : @{}), e);
+    // done 可为 nil（心跳/上报都不关心回包）——v0.5.6 三次 SIGSEGV 实锤：
+    // 崩点 api 完成块调 done 时 x21=0，far=0x10，正是 helloTick 传 done:nil 踩的
+    if (done) done(([obj isKindOfClass:[NSDictionary class]] ? obj : @{}), e);
   }] resume];
 }
 
