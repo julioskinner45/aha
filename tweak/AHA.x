@@ -58,6 +58,20 @@ static AHAPool *gPool = nil;
 static AHAUI   *gUI   = nil;
 
 static void ahaLog(NSString *lv, NSString *msg);          // 写日志 + 面板滚动
+// 观察窗：打开商品页后 30s 内记录 app 发出的每条虾皮请求（诊断「页面开了但没回包」）
+static NSDate *gObserveUntil = nil;
+static NSInteger gObsCount = 0;
+static void ahaObserveBegin(void) { gObserveUntil = [NSDate dateWithTimeIntervalSinceNow:30]; gObsCount = 0; }
+static void ahaObserveURL(NSString *u) {
+  if (!gObserveUntil || [gObserveUntil compare:[NSDate date]] == NSOrderedAscending) return;
+  if (gObsCount >= 50) return;
+  if (!u || u.length == 0) return;
+  NSURL *uu = [NSURL URLWithString:u];
+  NSString *host = uu.host ?: @"";
+  if (![host containsString:@"shopee"]) return;                 // 只看虾皮域，砍掉噪音
+  gObsCount++;
+  ahaLog(@"d", [NSString stringWithFormat:@"[观察] %@", u.length > 110 ? [NSString stringWithFormat:@"%@…", [u substringToIndex:110]] : u]);
+}
 static void ahaRefreshUI(void);                           // 主线程刷面板
 
 #pragma mark - 池客户端（接口声明）
@@ -91,6 +105,7 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
 - (void)rememberContext:(NSURLRequest *)req;              // 记 pdp 请求全套头（Direct PDP 用）
 - (void)inspectData:(NSData *)data response:(NSURLResponse *)resp
             request:(NSURLRequest *)req error:(NSError *)err;
+- (void)inspectJSON:(NSDictionary *)obj;                  // Ajie 同款：NSJSONSerialization 钩子喂进来的对象
 - (NSString *)bodyForShop:(NSString *)shop item:(NSString *)item;
 - (void)storeBody:(NSString *)body shop:(NSString *)shop item:(NSString *)item;
 - (NSDictionary *)contextCopy;
@@ -186,6 +201,43 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
 
 - (NSDictionary *)contextCopy {
   @synchronized (self) { return [_ctx copy]; }
+}
+
+// —— Ajie 1:1：get_pc 回包不管走哪种网络栈，最终都要过 NSJSONSerialization 解析——
+// 钩子那边把每个解析出的字典喂进来，这里只做形状识别（data.item 带 item_id/shop_id），
+// 命中就当作 get_pc 200 回包入库；形状不对立即返回，开销可忽略。
+- (void)inspectJSON:(NSDictionary *)obj {
+  if (!gPool || ![obj isKindOfClass:[NSDictionary class]]) return;
+  @try {
+    id data = obj[@"data"];
+    if (![data isKindOfClass:[NSDictionary class]]) return;
+    id item = data[@"item"];
+    if (![item isKindOfClass:[NSDictionary class]]) return;
+    NSString *iid  = [NSString stringWithFormat:@"%@", item[@"item_id"] ?: item[@"itemid"] ?: @""];
+    NSString *sid  = [NSString stringWithFormat:@"%@", item[@"shop_id"] ?: item[@"shopid"] ?: @""];
+    if (iid.length == 0 || sid.length == 0 || [iid isEqualToString:@"(null)"] || [sid isEqualToString:@"(null)"]) return;
+
+    NSString *body = [[NSString alloc] initWithData:
+        [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil] encoding:NSUTF8StringEncoding];
+    if (!body.length) return;
+
+    // 风控识别与 inspectData 同款
+    if ([body containsString:@"90309999"] || [obj[@"error"] isEqual:@90309999]) {
+      ahaLog(@"e", @"⛔ 命中风控墙（90309999，JSON 通道识别）——建议暂停歇会");
+      dispatch_async(gPool.q, ^{ [gPool riskHit]; });
+      ahaRefreshUI();
+      return;
+    }
+    if ([body containsString:@"266900002"] || [obj[@"error"] isEqual:@266900002]) {
+      ahaLog(@"w", @"⚠️ get_pc 报 266900002（JSON 通道识别）");
+      dispatch_async(gPool.q, ^{ [gPool riskHit]; });
+      ahaRefreshUI();
+      return;
+    }
+    dispatch_async(gPool.q, ^{ gPool.risk = NO; });
+    ahaLog(@"d", [NSString stringWithFormat:@"JSON 通道抓到 get_pc 回包 item %@ shop %@", iid, sid]);
+    [self storeBody:body shop:sid item:iid];
+  } @catch (__unused NSException *e) { /* 非目标 JSON，静默 */ }
 }
 @end
 
@@ -462,6 +514,7 @@ static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
     completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))handler {
   NSString *u = request.URL.absoluteString ?: @"";
+  ahaObserveURL(u);
   BOOL isPdp = ([u rangeOfString:kPdpMark].location != NSNotFound);
   if (isPdp) [[AHACapture shared] rememberContext:request];
   if (!isPdp || !handler) return %orig;
@@ -474,6 +527,7 @@ static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
 - (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)URL
     completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))handler {
   NSString *u = URL.absoluteString ?: @"";
+  ahaObserveURL(u);
   BOOL isPdp = ([u rangeOfString:kPdpMark].location != NSNotFound);
   if (!isPdp || !handler) return %orig;
   NSURLRequest *req = [NSURLRequest requestWithURL:URL];
@@ -482,6 +536,28 @@ static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
     [[AHACapture shared] inspectData:d response:r request:req error:e];
     handler(d, r, e);
   });
+}
+// —— 无 completionHandler 变体：delegate 式会话走这里，只观察不拦截（防漏看）——
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
+  ahaObserveURL(request.URL.absoluteString ?: @"");
+  return %orig;
+}
+- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)URL {
+  ahaObserveURL(URL.absoluteString ?: @"");
+  return %orig;
+}
+%end
+
+// —— Ajie 1:1 第三钩：NSJSONSerialization（万能兜底）——
+// 虾皮任何网络栈（delegate 式会话/自研封装）拿到回包后都要用系统 JSON 解析器，
+// 在这里按形状识别 get_pc 回包，delegate 会话也能抓到（Ajie 实证做法）
+%hook NSJSONSerialization
++ (id)JSONObjectWithData:(NSData *)data options:(NSUInteger)opts error:(NSError **)error {
+  id obj = %orig;
+  if ([obj isKindOfClass:[NSDictionary class]]) {
+    @try { [[AHACapture shared] inspectJSON:obj]; } @catch (__unused NSException *e) { /* 非目标 */ }
+  }
+  return obj;
 }
 %end
 
@@ -813,7 +889,8 @@ static void ahaRiskAlertShow(void) {
       }
       ahaStep(@"导航:结束");
       if (opened) {
-        ahaLog(@"i", [NSString stringWithFormat:@"已打开商品页 #%@", itemId]);
+        ahaLog(@"i", [NSString stringWithFormat:@"已打开商品页 #%@（app 内路由）", itemId]);
+        ahaObserveBegin();      // 开 30s 观察窗：app 每条虾皮请求都上日志
         return;
       }
       ahaLog(@"w", @"App 内路由不可用，靠 Direct PDP 兜底直取数据");
