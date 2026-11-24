@@ -75,14 +75,18 @@ static NSInteger gObsCount = 0;
 static NSInteger gObsAny = 0;      // v0.5.18：窗口内全部请求（不限域名）
 static NSInteger gObsShopee = 0;   // 窗口内虾皮域名请求
 static NSInteger gObsJSON = 0;     // 窗口内 NSJSON 解析次数
+static NSInteger gObsRecv = 0;     // v0.5.19：窗口内回包事件（completionHandler + delegate）
+static void ahaObserveRecv(void) {
+  if (gObserveUntil && [gObserveUntil compare:[NSDate date]] == NSOrderedAscending) gObsRecv++;
+}
 static NSMutableArray *gObsURLs = nil;
 static BOOL gObsFlushed = NO;
 static void ahaObserveFlush(void) {
   if (gObsFlushed) return;
   gObsFlushed = YES;
-  // v0.5.18：哪怕全 0 也打印摘要行——0 本身就是裁决性证据
-  ahaLog(@"i", [NSString stringWithFormat:@"观察窗: 请求%ld条(虾皮%ld) JSON解析%ld次",
-         (long)gObsAny, (long)gObsShopee, (long)gObsJSON]);
+  // v0.5.19：哪怕全 0 也打印摘要行——0 本身就是裁决性证据
+  ahaLog(@"i", [NSString stringWithFormat:@"观察窗: 请求%ld条(虾皮%ld) 回包%ld次 JSON解析%ld次",
+         (long)gObsAny, (long)gObsShopee, (long)gObsRecv, (long)gObsJSON]);
   NSUInteger n = gObsURLs.count;
   for (NSUInteger i = 0; i < n; i += 4) {
     NSRange r = NSMakeRange(i, MIN((NSUInteger)4, n - i));
@@ -93,7 +97,7 @@ static void ahaObserveFlush(void) {
 }
 static void ahaObserveBegin(void) {
   gObserveUntil = [NSDate dateWithTimeIntervalSinceNow:30];
-  gObsCount = 0; gObsAny = 0; gObsShopee = 0; gObsJSON = 0; gObsFlushed = NO;
+  gObsCount = 0; gObsAny = 0; gObsShopee = 0; gObsJSON = 0; gObsRecv = 0; gObsFlushed = NO;
   if (!gObsURLs) gObsURLs = [NSMutableArray array]; else [gObsURLs removeAllObjects];
 }
 static void ahaObserveURL(NSString *u) {
@@ -310,7 +314,7 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
     }
     dispatch_async(gPool.q, ^{ gPool.risk = NO; });
     dispatch_async(gPool.q, ^{ gPool.risk = NO; gPool.failStreak = 0; });
-    ahaLog(@"s", [NSString stringWithFormat:@"JSON 通道抓到 get_pc 回包 item %@ shop %@", iid, sid]);
+    ahaLog(@"s", [NSString stringWithFormat:@"JSON形状命中(按data.item识别) item %@ shop %@", iid, sid]);
     [self storeBody:body shop:sid item:iid];
   } @catch (__unused NSException *e) { /* 非目标 JSON，静默 */ }
 }
@@ -681,6 +685,7 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
   if (!isPdp || !handler) return %orig;
   NSURLRequest *reqCopy = [request copy];
   return %orig(request, ^(NSData *d, NSURLResponse *r, NSError *e) {
+    ahaObserveRecv();
     [[AHACapture shared] inspectData:d response:r request:reqCopy error:e];
     handler(d, r, e);
   });
@@ -695,10 +700,20 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
     [[AHACapture shared] rememberContext:req];
     ahaLog(@"i", @"get_pc 请求已发出（completionHandler 通道）");   // v0.5.15 诊断
     return %orig(URL, ^(NSData *d, NSURLResponse *r, NSError *e) {
+      ahaObserveRecv();
       [[AHACapture shared] inspectData:d response:r request:req error:e];
       if (handler) handler(d, r, e);
     });
   }
+  return %orig;
+}
+// v0.5.19：delegate 式会话（无 completionHandler）的发送此前完全隐形——只观察不包裹
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
+  ahaObserveURL(request.URL.absoluteString ?: @"");
+  return %orig;
+}
+- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)URL {
+  ahaObserveURL(URL.absoluteString ?: @"");
   return %orig;
 }
 %end
@@ -793,6 +808,7 @@ static void ahaSwizzleDelegate(id delegate) {
 }
 
 static void ahaDelegateDidReceiveData(id self, SEL _cmd, id module, id requestLike, NSData *data) {
+  ahaObserveRecv();   // v0.5.19：回包事件计数（delegate 通道）
   IMP orig = ahaOrigFor(gOrigDataDict, self);
   if (orig)
     ((void (*)(id, SEL, id, id, NSData *))orig)(self, _cmd, module, requestLike, data); // Ajie 同序：先过 orig
@@ -1429,7 +1445,9 @@ static void ahaLog(NSString *lv, NSString *msg) {
           dispatch_get_main_queue(), ^{
         UIViewController *after = ahaResolvedTopVC();
         if (after && after != before) {
-          ahaLog(@"i", [NSString stringWithFormat:@"跳转成功 item %@", itemId]);
+          // v0.5.19：跳到的页面类名——裁决「PDP VC 真开了但没发请求」还是「开成了别的页面」
+          ahaLog(@"i", [NSString stringWithFormat:@"跳转成功 item %@ 页面=%@",
+                 itemId, NSStringFromClass([after class])]);
           ahaObserveBegin();      // 观察窗只计数（不上日志）
           return;
         }
@@ -1446,7 +1464,8 @@ static void ahaLog(NSString *lv, NSString *msg) {
             dispatch_get_main_queue(), ^{
           UIViewController *after2 = ahaResolvedTopVC();
           if (after2 && after2 != before) {
-            ahaLog(@"i", [NSString stringWithFormat:@"跳转成功 item %@（商品直开）", itemId]);
+            ahaLog(@"i", [NSString stringWithFormat:@"跳转成功 item %@（商品直开）页面=%@",
+                   itemId, NSStringFromClass([after2 class])]);
           } else {
             ahaLog(@"w", @"内路由无效，改用链接跳转");
             ahaOpenUniversalLink(shopId, itemId, taskUrl);
