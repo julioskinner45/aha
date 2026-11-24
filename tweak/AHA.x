@@ -91,7 +91,6 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
 @property(nonatomic, strong) NSDate *lastRiskAlert;
 @property(nonatomic, assign) BOOL running, connected, resting, risk;
 @property(nonatomic, assign) NSInteger taken, ok, failStreak;   // 连续无数据计数（Ajie consecutivePDPFailures 1:1）
-@property(nonatomic, assign) NSInteger taken, ok;
 @property(nonatomic, copy) NSString *me, *token, *taskLine;
 @property(nonatomic, readonly) dispatch_queue_t q;
 - (void)connect:(void (^)(void))after;
@@ -1122,7 +1121,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
                   @"accountId": acct,
                   @"status": @"captured",
                   @"rawResponseText": pBody,
-                  @"reason": [NSString stringWithFormat:@"item-%@", pItem] }
+                  @"reason": [NSString stringWithFormat:@"item-%@ shop-%@", pItem, pShop] }
           done:^(NSDictionary *rj, NSError *re) {
         dispatch_async(self.q, ^{
           BOOL passed = [rj isKindOfClass:[NSDictionary class]] && [rj[@"passed"] boolValue];
