@@ -1,6 +1,11 @@
-// AHA.x — Shopee app 内采集客户端 v0.5.12（导航 = Ajie 逐字复刻 + 面包屑诊断）
+// AHA.x — Shopee app 内采集客户端 v0.5.13（导航 = Ajie 逐字复刻 + 面包屑诊断）
 //
 // v0.5.6 关键改动（对照 Ajie 0.1.3 反汇编逐条对齐）：
+// v0.5.13（2026-11-24）：导航/风控/日志/验券 全面对照 Ajie 反汇编 1:1 重做——
+//   导航=openCurrentTask 时序（popToRoot→0.35s→内路由→失败 Universal Link openURL 兜底，不再 Direct PDP 当导航用）；
+//   风控=删弹窗，266900002 按正常响应提交，90309999 自动停，直连失败不计风控，连续 2 次无数据自动暂停；
+//   日志=[HH:mm:ss] 时间戳+去噪（第三方挂钩/观察窗不再刷屏）+0.25s 合并刷新修乱跳；
+//   验券=优惠券检测（start/report 契约 1:1，设置里填后端用户ID开启）
 //   1. 导航管理器解析：BTAppManager/BTApplicationAddonProvider/SHPNavigator 三类候选
 //      → 单例 getter（sharedInstance/sharedManager/defaultManager/manager/shared）
 //      → 属性钻取（appManager/navigationManager/navigator/router/pageNavigator…），
@@ -66,14 +71,16 @@ static NSDate *gObserveUntil = nil;
 static NSInteger gObsCount = 0;
 static void ahaObserveBegin(void) { gObserveUntil = [NSDate dateWithTimeIntervalSinceNow:30]; gObsCount = 0; }
 static void ahaObserveURL(NSString *u) {
+  // 观察窗只计数不上日志——v0.5.12 用户反馈「日志莫名消失/乱跳」的主因就是这里
+  // 30 秒内几十条 URL 把 250 行日志窗冲掉。要诊断时打开下面注释即可。
   if (!gObserveUntil || [gObserveUntil compare:[NSDate date]] == NSOrderedAscending) return;
-  if (gObsCount >= 50) return;
+  if (gObsCount >= 200) return;
   if (!u || u.length == 0) return;
   NSURL *uu = [NSURL URLWithString:u];
   NSString *host = uu.host ?: @"";
-  if (![host containsString:@"shopee"]) return;                 // 只看虾皮域，砍掉噪音
+  if (![host containsString:@"shopee"]) return;                 // 只看虾皮域
   gObsCount++;
-  ahaLog(@"d", [NSString stringWithFormat:@"[观察] %@", u.length > 110 ? [NSString stringWithFormat:@"%@…", [u substringToIndex:110]] : u]);
+  // ahaLog(@"d", [NSString stringWithFormat:@"[观察] %@", u.length > 110 ? [NSString stringWithFormat:@"%@…", [u substringToIndex:110]] : u]);
 }
 static void ahaRefreshUI(void);                           // 主线程刷面板
 
@@ -83,6 +90,7 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
 @property(nonatomic, strong) NSMutableDictionary *cfg;
 @property(nonatomic, strong) NSDate *lastRiskAlert;
 @property(nonatomic, assign) BOOL running, connected, resting, risk;
+@property(nonatomic, assign) NSInteger taken, ok, failStreak;   // 连续无数据计数（Ajie consecutivePDPFailures 1:1）
 @property(nonatomic, assign) NSInteger taken, ok;
 @property(nonatomic, copy) NSString *me, *token, *taskLine;
 @property(nonatomic, readonly) dispatch_queue_t q;
@@ -90,7 +98,7 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
 - (void)startLoop;
 - (void)stopLoop;
 - (void)helloTick;
-- (void)riskHit;
+- (void)riskStop;
 - (void)saveCfg;
 - (NSInteger)num:(NSString *)k def:(NSInteger)d;
 - (NSString *)statusText;
@@ -153,22 +161,23 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
   NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
   if (!body.length) return;
 
-  // —— 风控识别（Ajie 同款判据 + 弹窗提醒）——
-  if (code == 403 || [body containsString:@"90309999"]) {
-    ahaLog(@"e", @"⛔ 命中风控墙（HTTP 403 / 90309999）——建议暂停歇会");
-    if (gPool) { dispatch_async(gPool.q, ^{ [gPool riskHit]; }); ahaRefreshUI(); }
+  // —— 风控识别（Ajie 反汇编 1:1：90309999=验证墙自动停；266900002=按正常响应提交；——
+  //     403 只是直连/网络失败，不进风控。Ajie 全程无弹窗）——
+  if ([body containsString:@"90309999"]) {
+    ahaLog(@"e", @"PDP返回90309999验证，已暂停");
+    if (gPool) dispatch_async(gPool.q, ^{ [gPool riskStop]; });
+    ahaRefreshUI();
     return;
   }
-  if ([body containsString:@"266900002"]) {
-    ahaLog(@"w", @"⚠️ get_pc 报 266900002（风控前置信号）");
-    if (gPool) { dispatch_async(gPool.q, ^{ [gPool riskHit]; }); ahaRefreshUI(); }
+  if (code == 403) {
+    ahaLog(@"w", @"get_pc 回 HTTP 403（不计入风控）");
     return;
   }
   if (code != 200) {
     ahaLog(@"w", [NSString stringWithFormat:@"get_pc HTTP %ld，未采", (long)code]);
     return;
   }
-  if (gPool) { dispatch_async(gPool.q, ^{ gPool.risk = NO; }); }
+  if (gPool) { dispatch_async(gPool.q, ^{ gPool.risk = NO; gPool.failStreak = 0; }); }
 
   // —— 存副本（shop/item 从 query 取）——
   NSURLComponents *uc = [NSURLComponents componentsWithURL:req.URL resolvingAgainstBaseURL:NO];
@@ -225,21 +234,16 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
         [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil] encoding:NSUTF8StringEncoding];
     if (!body.length) return;
 
-    // 风控识别与 inspectData 同款
+    // 风控识别（Ajie 判据：90309999=验证墙；266900002=正常提交）
     if ([body containsString:@"90309999"] || [obj[@"error"] isEqual:@90309999]) {
-      ahaLog(@"e", @"⛔ 命中风控墙（90309999，JSON 通道识别）——建议暂停歇会");
-      dispatch_async(gPool.q, ^{ [gPool riskHit]; });
-      ahaRefreshUI();
-      return;
-    }
-    if ([body containsString:@"266900002"] || [obj[@"error"] isEqual:@266900002]) {
-      ahaLog(@"w", @"⚠️ get_pc 报 266900002（JSON 通道识别）");
-      dispatch_async(gPool.q, ^{ [gPool riskHit]; });
+      ahaLog(@"e", @"PDP返回90309999验证，已暂停（JSON 通道）");
+      dispatch_async(gPool.q, ^{ [gPool riskStop]; });
       ahaRefreshUI();
       return;
     }
     dispatch_async(gPool.q, ^{ gPool.risk = NO; });
-    ahaLog(@"d", [NSString stringWithFormat:@"JSON 通道抓到 get_pc 回包 item %@ shop %@", iid, sid]);
+    dispatch_async(gPool.q, ^{ gPool.risk = NO; gPool.failStreak = 0; });
+    ahaLog(@"s", [NSString stringWithFormat:@"JSON 通道抓到 get_pc 回包 item %@ shop %@", iid, sid]);
     [self storeBody:body shop:sid item:iid];
   } @catch (__unused NSException *e) { /* 非目标 JSON，静默 */ }
 }
@@ -253,16 +257,10 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
     if (u.length && [u rangeOfString:kGetPcMark].location == NSNotFound) return;
     if (req && req.allHTTPHeaderFields.count) [self rememberContext:req];
 
-    // 风控识别（与 inspectData 同款；delegate 通道拿不到 HTTP 码，只看回包内容）
+    // 风控识别（Ajie 判据；delegate 通道拿不到 HTTP 码，只看回包内容）
     if ([body containsString:@"90309999"]) {
-      ahaLog(@"e", @"⛔ 命中风控墙（90309999，delegate 通道）——建议暂停歇会");
-      dispatch_async(gPool.q, ^{ [gPool riskHit]; });
-      ahaRefreshUI();
-      return;
-    }
-    if ([body containsString:@"266900002"]) {
-      ahaLog(@"w", @"⚠️ get_pc 报 266900002（delegate 通道）");
-      dispatch_async(gPool.q, ^{ [gPool riskHit]; });
+      ahaLog(@"e", @"PDP返回90309999验证，已暂停（delegate 通道）");
+      dispatch_async(gPool.q, ^{ [gPool riskStop]; });
       ahaRefreshUI();
       return;
     }
@@ -288,7 +286,7 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
     }
     if (![item isKindOfClass:[NSString class]] || item.length == 0 || [item isEqualToString:@"(null)"]) return;
     if (![shop isKindOfClass:[NSString class]] || shop.length == 0 || [shop isEqualToString:@"(null)"]) return;
-    dispatch_async(gPool.q, ^{ gPool.risk = NO; });
+    dispatch_async(gPool.q, ^{ gPool.risk = NO; gPool.failStreak = 0; });
     ahaLog(@"s", [NSString stringWithFormat:@"delegate 通道抓到 get_pc 回包 item %@ shop %@", item, shop]);
     [self storeBody:body shop:shop item:item];
   } @catch (__unused NSException *e) { /* 静默 */ }
@@ -516,9 +514,13 @@ static id ahaBuildPath(NSString *route) {
 static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
   ahaStep(@"导航:解析管理器");
   id nav = ahaResolveManager();
-  if (!nav) { ahaLog(@"i", @"内路由：没找到导航管理器（走网页兜底）"); return NO; }
+  if (!nav) { ahaLog(@"w", @"跳转失败:无导航器"); return NO; }
 
-  // route 4 连（Ajie 实证序）：item_id/shop_id → good_id/shop_id → shopid/itemid → PRODUCT_PAGE
+  // topVC 只取一次（Ajie navigateWithBTManagerToRoute 0x24028 同款：主入口取好往下传）
+  UIViewController *vc = ahaResolvedTopVC();
+  if (!vc) { ahaLog(@"w", @"跳转失败:无控制器"); return NO; }
+
+  // route 4 连（Ajie 0x241a4~0x243e0 逐条实证序完全一致）
   NSArray *routes = @[
     [NSString stringWithFormat:@"rn/PRODUCT_PAGE?item_id=%@&shop_id=%@", itemId, shopId],
     [NSString stringWithFormat:@"rn/PRODUCT_PAGE?good_id=%@&shop_id=%@", itemId, shopId],
@@ -533,8 +535,6 @@ static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
     id path = nil;
     @try { path = ahaBuildPath(route); } @catch (__unused NSException *e) { path = nil; }
     if (!path) continue;
-    UIViewController *vc = ahaResolvedTopVC();
-    if (!vc) { ahaLog(@"w", @"内路由：拿不到顶层页面"); continue; }
     if ([nav respondsToSelector:navSel]) {
       ahaStep(@"导航:navigate 调用");
       if (ahaInvoke(nav, navSel, @[vc, path, [NSNull null], [NSNull null]], @"navigate")) return YES;
@@ -545,21 +545,68 @@ static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
     }
   }
 
-  // —— Ajie 兜底级（invokeRouteNavigationOnManager 实证）：manager 自带的商品直开方法，
-  //    不需要路径对象，参数 [shopID, itemID]（nil→@""，Ajie 同款 csel）——
-  //    虾皮 3.50.50 上路径工厂对不上时，这才是正牌出路
+  // —— Ajie 兜底级（invokeRouteNavigationOnManager 0x23a44~0x23df0 实证）：
+  //    manager 自带的商品直开方法，不需要路径对象，参数 [shopID, itemID]（nil→@""）——
   NSString *shop = shopId ?: @"", *item = itemId ?: @"";
   for (NSString *m in @[@"navigateToProduct:goodID:", @"openProductPage:goodID:", @"openProduct:goodID:"]) {
     SEL s = NSSelectorFromString(m);
     if (![nav respondsToSelector:s]) continue;
     ahaStep(@"导航:商品直开");
     if (ahaInvoke(nav, s, @[shop, item], m)) {
-      ahaLog(@"i", [NSString stringWithFormat:@"内路由：%@ 调用成功", m]);
+      ahaLog(@"i", @"跳转成功（商品直开）");
       return YES;
     }
   }
-  ahaLog(@"w", @"内路由全部候选失败（路径式+商品直开），任务将回池重试");
+  ahaLog(@"w", @"跳转失败:路由无响应");
   return NO;
+}
+
+// —— Ajie popToRootViewControllerIfNeeded 0x21db0 逐指令复刻：
+// mainWindow root → resolvedTop 钻取 → 是 TabBar 就取 selectedVC → 拿 navigationController
+// → 栈深>1 才 popToRootViewControllerAnimated:（不是我们自己猜的 count>2 + routeBackOnce）——
+static void ahaPopToRootIfNeeded(void) {
+  UIWindow *own = ahaOwnWin();
+  UIWindow *main = nil;
+  for (UIWindow *w in [UIApplication sharedApplication].windows) {
+    if (w == own || !w.rootViewController) continue;
+    if (!main || w.isKeyWindow) main = w;
+    if (w.isKeyWindow) break;
+  }
+  if (!main) return;
+  UIViewController *vc = main.rootViewController;
+  while (vc.presentedViewController) vc = vc.presentedViewController;
+  if ([vc isKindOfClass:[UITabBarController class]])
+    vc = [(UITabBarController *)vc selectedViewController] ?: vc;
+  UINavigationController *nc = [vc isKindOfClass:[UINavigationController class]]
+      ? (UINavigationController *)vc : vc.navigationController;
+  if (nc && nc.viewControllers.count > 1) {
+    ahaStep(@"导航:回根");
+    [nc popToRootViewControllerAnimated:NO];
+    ahaLog(@"i", @"先回到首页再跳商品页");
+  }
+}
+
+// —— Ajie openCurrentTask 的 Universal Link 兜底 0x2fe2c~0x300d0 逐指令复刻：
+// 内路由失败后 openURL 打商品链接（UniversalLinksOnly 强制走 app 内跳转，不弹 Safari）；
+// 失败再「回退链接跳转」普通 openURL。URL 用任务自带的 taskUrl（= productURL 同源），
+// 空则按 Ajie 0x4f551 格式拼 https://shopee.tw/product/%@/%@ ——
+static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *taskUrl) {
+  NSString *u = taskUrl ?: @"";
+  if (u.length == 0 || ![u hasPrefix:@"http"])
+    u = [NSString stringWithFormat:@"https://shopee.tw/product/%@/%@", shopId ?: @"", itemId ?: @""];
+  NSURL *url = [NSURL URLWithString:u];
+  if (!url) { ahaLog(@"w", @"跳转失败:无URL"); return; }
+  UIApplication *app = [UIApplication sharedApplication];
+  void (^done)(BOOL) = ^(BOOL ok) {
+    ahaLog(ok ? @"i" : @"w", ok ? @"Universal Link跳转成功" : @"回退链接跳转失败");
+  };
+  [app openURL:url options:@{ UIApplicationOpenURLOptionUniversalLinksOnly: @YES }
+    completionHandler:^(BOOL ok) {
+      if (ok) { done(YES); return; }
+      // 回退：不带限制直接打开（Universal Link 被拒说明 app 没接这个域，会弹 Safari——
+      // Ajie 同款兜底，真机上虾皮认自家域，通常到不了这里）
+      [app openURL:url options:@{} completionHandler:^(BOOL ok2) { done(ok2); }];
+    }];
 }
 
 #pragma mark - 观察钩子（Ajie 同款：包 completionHandler，不碰 protocolClasses）
@@ -670,8 +717,10 @@ static void ahaSwizzleDelegate(id delegate) {
       MSHookMessageEx(cls, selDone, (IMP)ahaDelegateDidComplete, &origDone);
       if (origDone) @synchronized (gOrigDoneDict) { gOrigDoneDict[cn] = [NSValue valueWithPointer:origDone]; }
     }
-    ahaLog(@"d", [NSString stringWithFormat:@"已挂钩 session delegate %@（%@）", cn,
-        shpWay ? @"shp 自家回调" : @"URLSession 回调"]);
+    // 只对钩到虾皮自家回调的 delegate 打一条日志——第三方 SDK（Firebase/AppsFlyer 等
+    // 走 URLSession 回调的）全是废日志，用户反馈「没用的日志别出现」
+    if (shpWay)
+      ahaLog(@"i", [NSString stringWithFormat:@"已挂钩 %@（shp 自家回调）", cn]);
   } @catch (__unused NSException *e) { /* 静默 */ }
 }
 
@@ -807,7 +856,7 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
 }
 
 - (NSString *)statusText {
-  if (self.risk) return @"● 疑似风控（建议暂停）";
+  if (self.risk) return @"● 此账号已风控！";
   if (!self.connected) return @"● 未连接";
   if (!self.running) return [NSString stringWithFormat:@"● 已连接 %@（待机）", self.me ?: @""];
   if (self.resting) return @"● 休息中";
@@ -825,17 +874,13 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
 - (void)resetCounters { self.taken = 0; self.ok = 0; self.taskLine = @""; }
 
 - (void)appendLog:(NSString *)lv msg:(NSString *)msg {
-  NSString *line;
-  if ([lv isEqualToString:@"s"]) line = [NSString stringWithFormat:@"✔ %@", msg];
-  else if ([lv isEqualToString:@"e"]) line = [NSString stringWithFormat:@"✖ %@", msg];
-  else if ([lv isEqualToString:@"w"]) line = [NSString stringWithFormat:@"⚠ %@", msg];
-  else line = msg;
+  // Ajie 风格：纯文本消息，时间用 [] 框住（用户指定）；不再用 ✔✖⚠ 前缀
   static NSDateFormatter *df; static dispatch_once_t dOnce;
   dispatch_once(&dOnce, ^{
     df = [[NSDateFormatter alloc] init];
     df.dateFormat = @"HH:mm:ss";
   });
-  line = [NSString stringWithFormat:@"%@ %@", [df stringFromDate:[NSDate date]], line];
+  NSString *line = [NSString stringWithFormat:@"[%@] %@", [df stringFromDate:[NSDate date]], msg ?: @""];
   @synchronized (_logs) {
     [_logs addObject:line];
     if (_logs.count > 250) [_logs removeObjectsInRange:NSMakeRange(0, _logs.count - 250)];
@@ -847,30 +892,31 @@ static void ahaLog(NSString *lv, NSString *msg) {
   if (gPool) [gPool appendLog:(lv ?: @"i") msg:(msg ?: @"")];
 }
 
-// —— 风控提醒（Ajie 同款弹窗）：状态沿触发 + 5 分钟节流，弹在我们自己的悬浮窗上 ——
-static void ahaRiskAlertShow(void) {
-  dispatch_async(dispatch_get_main_queue(), ^{
-    UIWindow *w = ahaOwnWin();
-    if (!w || !w.rootViewController) return;
-    UIViewController *top = w.rootViewController;
-    while (top.presentedViewController) top = top.presentedViewController;
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"⚠️ 风控提醒"
-        message:@"命中虾皮风控墙（HTTP 403 / 90309999 / get_pc 266900002）。\n建议点「■ 停止采集」歇几分钟再继续，频繁硬闯会加重。"
-        preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
-    [top presentViewController:a animated:YES completion:nil];
-  });
+// —— 风控自动停（Ajie handleRiskControlDetectedWithMessage 反汇编 1:1）：
+// isRiskControlled=YES + 停循环 + 清在途标志。Ajie 全程无弹窗，只留日志与状态行 ——
+- (void)riskStop {
+  self.risk = YES;
+  if (!self.running) return;
+  self.running = NO;
+  self.resting = NO;
+  self.taskLine = @"";
+  ahaRefreshUI();
 }
 
-- (void)riskHit {
-  BOOL edge = !self.risk;                       // 未风控 → 风控 的跳变才弹
-  NSDate *last = self.lastRiskAlert;
-  BOOL throttled = (!edge && last && [last timeIntervalSinceNow] > -300);  // 持续风控期 5 分钟提醒一次
-  self.risk = YES;
-  if (edge || !throttled) {
-    self.lastRiskAlert = [NSDate date];
-    ahaRiskAlertShow();
+// —— 连续无数据（Ajie handleNoDataCapture 1:1）：
+// 直连失败不计入；连续 2 次 → 「疑似触发风控或验证码」+ 自动暂停 ——
+- (void)noteCaptureFailure:(BOOL)directOnly {
+  if (directOnly) {
+    ahaLog(@"w", @"直连失败，不计入风控");
+    return;
   }
+  self.failStreak++;
+  if (self.failStreak < 2) {
+    ahaLog(@"w", [NSString stringWithFormat:@"没等到商品数据（连续 %ld 次）", (long)self.failStreak]);
+    return;
+  }
+  ahaLog(@"e", @"连续两次未获取到数据，疑似触发风控或验证码，请手动查看，已自动暂停");
+  [self riskStop];
 }
 
 // —— HTTP（默认会话；pdp 请求顺带被钩子记住上下文，喂给 Direct PDP）——
@@ -940,7 +986,7 @@ static void ahaRiskAlertShow(void) {
 - (void)beginRun {
   dispatch_async(self.q, ^{
     if (self.running) return;
-    self.running = YES; self.resting = NO; self.risk = NO;
+    self.running = YES; self.resting = NO; self.risk = NO; self.failStreak = 0;
     ahaLog(@"s", @"领单循环已开始");
     ahaRefreshUI();
     [self takeOnce];
@@ -970,7 +1016,155 @@ static void ahaRiskAlertShow(void) {
   });
 }
 
+// —— 优惠券检测（验券，Ajie 0x187d8~0x1ad68 逐函数 1:1）——
+// 服务：http://103.146.231.72:1998（Ajie 同款验券服务+固定 token，用户在设置里填「后端用户ID」开启）
+// start : POST /api/coupon-preflight/start/  {shopeeUserId, shopeeUsername, force}
+//         resp {allowed, required, dayKey, probe:{id,url,shopId,itemId}}
+//         allowed 且 !required → 直接过；required → 探测 probe.url（GET+重放 app 上下文，get_pc 同款）→ report
+// report: POST /api/coupon-preflight/report/  {probeId, accountId, status:'captured', rawResponseText, reason}
+//         resp {passed, reason}
+- (void)couponRequest:(NSString *)path body:(NSDictionary *)body
+               done:(void (^)(NSDictionary *, NSError *))done {
+  NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
+      [NSURL URLWithString:[@"http://103.146.231.72:1998" stringByAppendingString:path]]];
+  req.HTTPMethod = @"POST";
+  req.timeoutInterval = 20;
+  [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+  [req setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+  // Ajie sendCouponRequest 实锤：固定 Bearer token（0x188cc）
+  [req setValue:@"Bearer -CN6_PNYhHpDzN-qJw-RGecT5vOM1nY8zqORenKnFnw"
+      forHTTPHeaderField:@"Authorization"];
+  if (body) req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+  static NSURLSession *sess = nil; static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    sess = AhaSession([NSURLSessionConfiguration ephemeralSessionConfiguration]);
+  });
+  [[sess dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+    NSDictionary *j = nil;
+    if (!e && d) j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+    done(j, e);
+  }] resume];
+}
+
+- (NSString *)couponTodayKey {
+  static NSDateFormatter *df; static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"yyyyMMdd";
+    df.timeZone = [NSTimeZone timeZoneWithName:@"Asia/Taipei"];
+  });
+  return [df stringFromDate:[NSDate date]];
+}
+
+// 领单前的验券闸门（Ajie takeTaskAfterCouponPreflight 1:1）：ok=YES 才继续领单
+- (void)couponPreflightThen:(void (^)(BOOL ok))next {
+  NSString *acct = [self.cfg[@"couponAcct"] stringByTrimmingCharactersInSet:
+      [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  if (acct.length == 0) { next(YES); return; }              // 没填账号 = 不启用
+  // 今日已检测过 → 直接放行（Ajie couponPassedUserId/couponPassedDayKey 缓存同款）
+  if ([self.cfg[@"couponPassedUserId"] isEqualToString:acct] &&
+      [self.cfg[@"couponPassedDayKey"] isEqualToString:[self couponTodayKey]]) {
+    ahaLog(@"i", @"优惠券预检通过（今日已检测）");
+    next(YES); return;
+  }
+  ahaLog(@"i", @"优惠券预检中...");
+  [self couponRequest:@"/api/coupon-preflight/start/"
+      body:@{ @"shopeeUserId": acct, @"shopeeUsername": self.cfg[@"user"] ?: @"", @"force": @NO }
+      done:^(NSDictionary *j, NSError *e) {
+    dispatch_async(self.q, ^{
+      if (e || ![j isKindOfClass:[NSDictionary class]]) {
+        ahaLog(@"e", [NSString stringWithFormat:@"优惠券预检失败:%@", e.localizedDescription ?: @"响应异常"]);
+        next(NO); return;
+      }
+      BOOL allowed  = [j[@"allowed"] boolValue];
+      BOOL required = [j[@"required"] boolValue];
+      if (allowed && !required) {
+        self.cfg[@"couponPassedUserId"] = acct;
+        self.cfg[@"couponPassedDayKey"] = [NSString stringWithFormat:@"%@", j[@"dayKey"] ?: [self couponTodayKey]];
+        [self saveCfg];
+        ahaLog(@"i", @"优惠券预检通过（今日已检测）");
+        next(YES); return;
+      }
+      NSDictionary *probe = j[@"probe"];
+      if (!required || ![probe isKindOfClass:[NSDictionary class]] ||
+          [NSString stringWithFormat:@"%@", probe[@"url"] ?: @""].length == 0) {
+        ahaLog(@"e", @"优惠券预检失败: 服务端未下发探测任务");
+        next(NO); return;
+      }
+      // 探测：GET probe.url（get_pc 同款形态），重放 app 上下文头（directFetch 复用）
+      NSString *pUrl  = [NSString stringWithFormat:@"%@", probe[@"url"] ?: @""];
+      NSString *pShop = [NSString stringWithFormat:@"%@", probe[@"shopId"] ?: @""];
+      NSString *pItem = [NSString stringWithFormat:@"%@", probe[@"itemId"] ?: @""];
+      ahaLog(@"i", @"开始优惠券数据检测...");
+      NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:pUrl]];
+      req.HTTPMethod = @"GET"; req.timeoutInterval = 20;
+      NSDictionary *ctx = [[AHACapture shared] contextCopy];
+      for (NSString *k in ctx) {
+        if ([k caseInsensitiveCompare:@"Content-Length"] == NSOrderedSame) continue;
+        [req setValue:ctx[k] forHTTPHeaderField:k];
+      }
+      __block NSString *pBody = nil;
+      dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+      [[AhaSession([NSURLSessionConfiguration ephemeralSessionConfiguration])
+        dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *err) {
+        NSHTTPURLResponse *hr = [r isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)r : nil;
+        if (!err && d && hr.statusCode == 200)
+          pBody = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+        else
+          ahaLog(@"w", [NSString stringWithFormat:@"优惠券检测获取数据失败:HTTP=%ld", (long)hr.statusCode]);
+        dispatch_semaphore_signal(sem);
+      }] resume];
+      dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(22 * NSEC_PER_SEC)));
+      if (pBody.length == 0) { next(NO); return; }
+      ahaLog(@"i", @"优惠券检测数据已采集，上报中...");
+      [self couponRequest:@"/api/coupon-preflight/report/"
+          body:@{ @"probeId":  [NSString stringWithFormat:@"%@", probe[@"id"] ?: @""],
+                  @"accountId": acct,
+                  @"status": @"captured",
+                  @"rawResponseText": pBody,
+                  @"reason": [NSString stringWithFormat:@"item-%@", pItem] }
+          done:^(NSDictionary *rj, NSError *re) {
+        dispatch_async(self.q, ^{
+          BOOL passed = [rj isKindOfClass:[NSDictionary class]] && [rj[@"passed"] boolValue];
+          if (passed) {
+            self.cfg[@"couponPassedUserId"] = acct;
+            self.cfg[@"couponPassedDayKey"] = [self couponTodayKey];
+            [self saveCfg];
+            ahaLog(@"s", @"优惠券检测通过");
+            next(YES);
+          } else {
+            ahaLog(@"e", [NSString stringWithFormat:@"优惠券检测未通过:%@",
+                (rj[@"reason"] ?: (re.localizedDescription ?: @"数据异常"))]);
+            next(NO);
+          }
+        });
+      }];
+    });
+  }];
+}
+
 - (void)takeOnce {
+  dispatch_async(self.q, ^{
+    if (!self.running || !self.token) { ahaRefreshUI(); return; }
+    // 验券闸门（Ajie takeTaskAfterCouponPreflight 1:1）：设置里填了「后端用户ID」才启用
+    if ([self.cfg[@"couponAcct"] length] > 0) {
+      [self couponPreflightThen:^(BOOL ok) {
+        dispatch_async(self.q, ^{
+          if (ok) { [self takeOnceGo]; }
+          else {
+            self.taskLine = @"";
+            ahaRefreshUI();
+            [self scheduleNext:MAX([self randomGap], 30)];   // 未通过歇一会再试
+          }
+        });
+      }];
+      return;
+    }
+    [self takeOnceGo];
+  });
+}
+
+- (void)takeOnceGo {
   dispatch_async(self.q, ^{
     if (!self.running || !self.token) { ahaRefreshUI(); return; }
     // 休息窗口（开关开着 + 每达 restEvery 单歇 restSec 秒）
@@ -1064,39 +1258,29 @@ static void ahaRiskAlertShow(void) {
   ahaLog(@"s", [NSString stringWithFormat:@"领到单 #%@ [%@] item %@ shop %@", taskId, acct, itemId, shopId]);
   ahaRefreshUI();
 
-  // App 内路由导航（Ajie 全流程）：收弹层 → 栈深回根（manager 级 routeBackOnce 优先）→
-  // 等 0.4 秒（Ajie 0.35s，不跟回根动画打架）→ 路径式导航 → 商品直开兜底；
-  // 全失败不跳 Safari（独立进程抓不到 get_pc），靠 Direct PDP 兜底
+  // 导航 = Ajie openCurrentTask 0x2f7fc 时序 1:1：
+  // popToRootViewControllerIfNeeded → 0.35s → 内路由（4 route + 商品直开三连）
+  // → 失败 → Universal Link 兜底（app 内打开商品页，不是 Direct PDP——页面必须真开）
+  // 注：导航前不收弹层（Ajie 无此步骤；收弹层留给每单结束的白板自清理）
   dispatch_async(dispatch_get_main_queue(), ^{
-    // ① 收掉叠出来的弹层——白板「重新載入」就是一层层 present 出来的，先全收
-    UIViewController *top = ahaResolvedTopVC();
-    while (top && top.presentedViewController) {
-      ahaStep(@"导航:收弹层");
-      [top dismissViewControllerAnimated:NO completion:nil];
-    }
-    // ② 栈深超 2 层先回根：Ajie 的 manager 级回退优先，UINavigationController 兜底
-    UINavigationController *nc = ahaShopeeNav();
-    if (nc && nc.viewControllers.count > 2) {
-      ahaStep(@"导航:回根");
-      ahaRouteBackOnce();
-      if (nc.viewControllers.count > 2) [nc popToRootViewControllerAnimated:NO];
-      ahaLog(@"i", @"栈深超 2 层，先回首页再跳");
-    }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+    ahaPopToRootIfNeeded();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{
       BOOL opened = NO;
       ahaStep(@"导航:开始");
       @try { opened = ahaNavInApp(shopId, itemId); } @catch (NSException *e) {
-        ahaLog(@"e", [NSString stringWithFormat:@"导航异常已拦截：%@", e.reason]);
+        ahaLog(@"e", [NSString stringWithFormat:@"导航异常:%@", e.reason]);
         opened = NO;
       }
       ahaStep(@"导航:结束");
       if (opened) {
-        ahaLog(@"i", [NSString stringWithFormat:@"已打开商品页 #%@（app 内路由）", itemId]);
-        ahaObserveBegin();      // 开 30s 观察窗：app 每条虾皮请求都上日志
+        ahaLog(@"i", [NSString stringWithFormat:@"跳转成功 item %@", itemId]);
+        ahaObserveBegin();      // 观察窗只计数（不上日志）
         return;
       }
-      ahaLog(@"w", @"App 内路由不可用，靠 Direct PDP 兜底直取数据");
+      // 内路由全失败 → Ajie 同款 Universal Link 兜底（打开商品页让 app 自己发 get_pc）
+      ahaOpenUniversalLink(shopId, itemId, taskUrl);
+      ahaObserveBegin();
     });
   });
 
@@ -1104,21 +1288,23 @@ static void ahaRiskAlertShow(void) {
   NSString *jxServer = [NSString stringWithFormat:@"%@", t[@"jxServer"] ?: @""];
   NSString *subTok   = [NSString stringWithFormat:@"%@", t[@"submitToken"] ?: @""];
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-    // 等 app 自己的 get_pc 回包（最长 20 秒，0.5s 轮询；睡在后台队列，不堵 _q / 主线程）
+    // 等 app 自己的 get_pc 回包（最长 15 秒，0.5s 轮询；睡在后台队列，不堵 _q / 主线程）
     __block NSString *body = nil;
-    for (int i = 0; i < 40 && !body; i++) {
+    for (int i = 0; i < 30 && !body; i++) {
       [NSThread sleepForTimeInterval:0.5];
       body = [[AHACapture shared] bodyForShop:shopId item:itemId];
-      if (i == 19 && !body)
-        ahaLog(@"i", [NSString stringWithFormat:@"#%@ 商品页开了但 10 秒还没等到回包，继续等…", taskId]);
     }
     NSString *via = @"app截包";
     if (!body) {
-      ahaLog(@"i", [NSString stringWithFormat:@"#%@ 没等到 app 回包，Direct PDP 兜底直调…", taskId]);
+      // app 抓包超时 = 页面没开/没发 get_pc → 计入连续失败（Ajie handleNoDataCapture 语义）
+      dispatch_async(self.q, ^{ [self noteCaptureFailure:NO]; });
+      ahaLog(@"i", @"等待获取数据超时，Direct PDP 兜底直调");
       ahaStep(@"任务:DirectPDP兜底");
       body = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
       via = @"DirectPDP";
+      if (!body) ahaLog(@"w", @"直连失败，不计入风控");
     }
+    if (body) dispatch_async(self.q, ^{ self.failStreak = 0; gPool.risk = NO; });
     // 白板自清理：这一单走完（成/败都一样），把商品页退掉——
     // 加载失败的商品页会弹「重新載入」白板，一层层叠下去屏幕就黑了
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1572,19 +1758,26 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
 }
 
 - (void)showSettings {
-  UIAlertController *a = [UIAlertController alertControllerWithTitle:@"服务器地址"
-      message:nil preferredStyle:UIAlertControllerStyleAlert];
+  UIAlertController *a = [UIAlertController alertControllerWithTitle:@"服务器地址 / 验券账号"
+      message:@"第二格填验券服务的「后端用户ID」，留空 = 关闭优惠券检测" preferredStyle:UIAlertControllerStyleAlert];
   [a addTextFieldWithConfigurationHandler:^(UITextField *f) {
     f.placeholder = @"https://140.235.98.220:29690";
     f.text = gPool.cfg[@"server"] ?: @"";
+  }];
+  [a addTextFieldWithConfigurationHandler:^(UITextField *f) {
+    f.placeholder = @"优惠券账号ID（留空关闭验券）";
+    f.text = gPool.cfg[@"couponAcct"] ?: @"";
   }];
   [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *act) {
     NSString *sv = a.textFields[0].text ?: @"";
     if (sv.length) {
       gPool.cfg[@"server"] = sv;
-      [gPool saveCfg];
       ahaLog(@"i", @"服务器已保存");
     }
+    gPool.cfg[@"couponAcct"] = [a.textFields[1].text stringByTrimmingCharactersInSet:
+        [NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+    [gPool saveCfg];
+    if ([gPool.cfg[@"couponAcct"] length]) ahaLog(@"i", @"优惠券检测已开启：领取任务前先检测优惠券数据");
   }]];
   [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
   UIViewController *top = self.win.rootViewController;
@@ -1661,17 +1854,29 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   self.miniInfo.text = [NSString stringWithFormat:@"成 %ld", (long)gPool.ok];
   NSArray *lines = gPool.logLines;
   if (lines.count) {
-    self.logView.text = [lines componentsJoinedByString:@"\n"];
-    [self.logView scrollRangeToVisible:NSMakeRange(self.logView.text.length, 0)];
+    NSString *txt = [lines componentsJoinedByString:@"\n"];
+    if (![txt isEqualToString:self.logView.text]) {   // 内容没变不重排（修日志乱跳）
+      self.logView.text = txt;
+      [self.logView scrollRangeToVisible:NSMakeRange(txt.length, 0)];
+    }
   }
 }
 
 @end
 
 static void ahaRefreshUI(void) {
-  dispatch_async(dispatch_get_main_queue(), ^{
-    if (gUI) [gUI refresh];
+  // 日志高频刷新合并：0.25s 内多条日志只刷一次（修日志乱跳）
+  static dispatch_source_t timer; static BOOL pending = NO;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC, 100 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(timer, ^{
+      if (pending && gUI) { pending = NO; [gUI refresh]; }
+    });
+    dispatch_resume(timer);
   });
+  pending = YES;   // 到点统一刷；立即刷会被 250ms 合并窗吸收
 }
 
 #pragma mark - 面板容器实现（要在 AHAUI 接口之后才能调 layoutPanel）
