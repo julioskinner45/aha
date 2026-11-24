@@ -681,25 +681,19 @@ static void ahaPopToRootIfNeeded(void) {
 }
 
 // —— Ajie openCurrentTask 的 Universal Link 兜底 0x2fe2c~0x300d0 逐指令复刻：
-// 内路由失败后 openURL 打商品链接（UniversalLinksOnly 强制走 app 内跳转，不弹 Safari）；
-// 失败再「回退链接跳转」普通 openURL。URL 用任务自带的 taskUrl（= productURL 同源），
-// 空则按 Ajie 0x4f551 格式拼 https://shopee.tw/product/%@/%@ ——
+// 内路由失败后 openURL 打商品链接（UniversalLinksOnly 强制走 app 内跳转）。
+// v0.5.27 用户指令：删掉「回退链接跳转」（普通 openURL 会弹 Safari 往网页跳）——
+// app 没接这个域时宁可跳转失败任务回池，绝不弹网页。
 static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *taskUrl) {
   NSString *u = taskUrl ?: @"";
   if (u.length == 0 || ![u hasPrefix:@"http"])
     u = [NSString stringWithFormat:@"https://shopee.tw/product/%@/%@", shopId ?: @"", itemId ?: @""];
   NSURL *url = [NSURL URLWithString:u];
   if (!url) { ahaLog(@"w", @"跳转失败:无URL"); return; }
-  UIApplication *app = [UIApplication sharedApplication];
-  void (^done)(BOOL) = ^(BOOL ok) {
-    ahaLog(ok ? @"i" : @"w", ok ? @"Universal Link跳转成功" : @"回退链接跳转失败");
-  };
-  [app openURL:url options:@{ UIApplicationOpenURLOptionUniversalLinksOnly: @YES }
+  [[UIApplication sharedApplication] openURL:url
+    options:@{ UIApplicationOpenURLOptionUniversalLinksOnly: @YES }
     completionHandler:^(BOOL ok) {
-      if (ok) { done(YES); return; }
-      // 回退：不带限制直接打开（Universal Link 被拒说明 app 没接这个域，会弹 Safari——
-      // Ajie 同款兜底，真机上虾皮认自家域，通常到不了这里）
-      [app openURL:url options:@{} completionHandler:^(BOOL ok2) { done(ok2); }];
+      ahaLog(ok ? @"i" : @"w", ok ? @"Universal Link跳转成功" : @"Universal Link被拒（不弹网页，任务照常走）");
     }];
 }
 
@@ -1652,19 +1646,22 @@ static void ahaLog(NSString *lv, NSString *msg) {
       dispatch_async(self.q, ^{
         BOOL ok = NO;
         NSString *codeTxt = @"无回包", *msgTxt = @"";
-        // v0.5.26 回包判定实证（重交探针）：{"code":"200","data":{"code":"ERROR","msg":"结果有误"},"msg":null}
-        // 外层 code 恒为字符串信封 "200"（NSString，老 isEqual:@200 的 NSNumber 比较必假）；
-        // 真判定在 data.code（成功="200"，失败="ERROR"+msg）。判定与 PC collectSubmit 同构。
+        // v0.5.27 判定实证（19:08 三单聚星完成、回包 data.code=无）：成功回包 data 里没有 code 字段！
+        // 与 PC collectSubmit 同构：信封 code==='200'（字符串）+ 有 data + 非 ERROR；
+        // 失败探针回包 {"code":"200","data":{"code":"ERROR","msg":"结果有误"}}
         NSString *raw = (d.length ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : @"") ?: @"";
+        NSString *rawHead = raw.length > 80 ? [[raw substringToIndex:80] stringByAppendingString:@"…"] : raw;
         id o = raw.length ? [NSJSONSerialization JSONObjectWithData:[raw dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil] : nil;
         if ([o isKindOfClass:[NSDictionary class]]) {
           NSDictionary *dt = [o[@"data"] isKindOfClass:[NSDictionary class]] ? (NSDictionary *)o[@"data"] : nil;
-          codeTxt = dt ? [NSString stringWithFormat:@"%@", dt[@"code"] ?: @""] : @"";
-          id m = dt ? dt[@"msg"] : o[@"msg"];
+          id m = dt ? (dt[@"msg"] ?: o[@"msg"]) : o[@"msg"];
           msgTxt = [m isKindOfClass:[NSString class]] ? (NSString *)m : @"";
-          ok = [codeTxt isEqualToString:@"200"];
+          NSString *env = [NSString stringWithFormat:@"%@", o[@"code"] ?: @""];
+          NSString *dcs = dt ? [NSString stringWithFormat:@"%@", dt[@"code"] ?: @""] : @"";
+          ok = [env isEqualToString:@"200"] && dt && ![dcs isEqualToString:@"ERROR"];
+          codeTxt = dcs.length ? dcs : (dt ? @"data有(无code)" : @"data无");
         } else if (raw.length) {
-          codeTxt = raw.length > 100 ? [[raw substringToIndex:100] stringByAppendingString:@"…"] : raw;
+          codeTxt = rawHead;
         }
         if (!ok && raw.length) {
           if ([raw containsString:@"或者已经完成过了"]) ok = YES;
@@ -1673,7 +1670,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
         }
         ahaLog(ok ? @"s" : @"i",
             [NSString stringWithFormat:@"#%@ 聚星直传%@", taskId,
-              ok ? @"成功" : [NSString stringWithFormat:@"失败(data.code=%@ msg=%@)，转中枢代交", codeTxt, msgTxt]]);
+              ok ? @"成功" : [NSString stringWithFormat:@"失败(code=%@ msg=%@ raw=%@)，转中枢代交", codeTxt, msgTxt, rawHead]]);
         if (ok) [self markOk:taskId via:@"聚星直传"];
         else [self hubSubmit:taskId taskUrl:taskUrl result:result];
       });
