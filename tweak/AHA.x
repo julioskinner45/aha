@@ -67,20 +67,46 @@ static AHAUI   *gUI   = nil;
 
 static void ahaLog(NSString *lv, NSString *msg);          // 写日志 + 面板滚动
 // 观察窗：打开商品页后 30s 内记录 app 发出的每条虾皮请求（诊断「页面开了但没回包」）
+// v0.5.16：去重收集 host+path（pdp/get_pc 保留 query），窗口结束/超时一次性刷出——
+// 这次要回答「导航后 app 到底请求了什么端点」：如果列表里没有任何 pdp 端点，
+// 说明 get_pc 路径假设是错的或者请求根本没发；有端点但没抓到=匹配规则错
 static NSDate *gObserveUntil = nil;
 static NSInteger gObsCount = 0;
-static void ahaObserveBegin(void) { gObserveUntil = [NSDate dateWithTimeIntervalSinceNow:30]; gObsCount = 0; }
+static NSMutableArray *gObsURLs = nil;
+static BOOL gObsFlushed = NO;
+static void ahaObserveFlush(void) {
+  if (gObsFlushed || !gObsURLs.count) { gObsFlushed = YES; return; }
+  gObsFlushed = YES;
+  NSUInteger n = gObsURLs.count;
+  for (NSUInteger i = 0; i < n; i += 4) {
+    NSRange r = NSMakeRange(i, MIN((NSUInteger)4, n - i));
+    NSString *line = [gObsURLs subarrayWithRange:r].componentsJoinedByString:@" | "];
+    ahaLog(@"i", [NSString stringWithFormat:@"观察窗URL(%lu/%lu): %@", (unsigned long)i + r.length, (unsigned long)n, line]);
+  }
+  [gObsURLs removeAllObjects];
+}
+static void ahaObserveBegin(void) {
+  gObserveUntil = [NSDate dateWithTimeIntervalSinceNow:30];
+  gObsCount = 0; gObsFlushed = NO;
+  if (!gObsURLs) gObsURLs = [NSMutableArray array]; else [gObsURLs removeAllObjects];
+}
 static void ahaObserveURL(NSString *u) {
-  // 观察窗只计数不上日志——v0.5.12 用户反馈「日志莫名消失/乱跳」的主因就是这里
-  // 30 秒内几十条 URL 把 250 行日志窗冲掉。要诊断时打开下面注释即可。
-  if (!gObserveUntil || [gObserveUntil compare:[NSDate date]] == NSOrderedAscending) return;
-  if (gObsCount >= 200) return;
+  if (!gObserveUntil || [gObserveUntil compare:[NSDate date]] == NSOrderedAscending) {
+    if (!gObsFlushed) ahaObserveFlush();          // 窗口自然到期 → 惰性刷出
+    return;
+  }
+  if (gObsCount >= 60) return;
   if (!u || u.length == 0) return;
   NSURL *uu = [NSURL URLWithString:u];
   NSString *host = uu.host ?: @"";
   if (![host containsString:@"shopee"]) return;                 // 只看虾皮域
   gObsCount++;
-  // ahaLog(@"d", [NSString stringWithFormat:@"[观察] %@", u.length > 110 ? [NSString stringWithFormat:@"%@…", [u substringToIndex:110]] : u]);
+  NSString *path = [NSString stringWithFormat:@"%@%@", host, uu.path ?: @""];
+  NSString *q = uu.query ?: @"";
+  if (q.length && ([path containsString:@"pdp"] || [path containsString:@"get_pc"]))
+    path = [NSString stringWithFormat:@"%@?%@", path, q.length > 80 ? [q substringToIndex:80] : q];
+  if (path.length > 130) path = [[path substringToIndex:130] stringByAppendingString:@"…"];
+  if (![gObsURLs containsObject:path] && gObsURLs.count < 24) [gObsURLs addObject:path];
 }
 static void ahaRefreshUI(void);                           // 主线程刷面板
 
@@ -737,9 +763,12 @@ static void ahaDelegateDidReceiveData(id self, SEL _cmd, id module, id requestLi
       // URLSession 路径：pdp 请求头快照（原无 completionHandler 钩子的职责，Ajie 也在这里记上下文）
       NSURLSessionTask *task = (NSURLSessionTask *)requestLike;
       NSURLRequest *req = task.currentRequest;
-      if (req && req.allHTTPHeaderFields.count &&
-          [req.URL.absoluteString rangeOfString:kPdpMark].location != NSNotFound)
-        [[AHACapture shared] rememberContext:req];
+      if (req) {
+        ahaObserveURL(req.URL.absoluteString);            // v0.5.16：delegate 会话的请求也进观察窗
+        if (req.allHTTPHeaderFields.count &&
+            [req.URL.absoluteString rangeOfString:kPdpMark].location != NSNotFound)
+          [[AHACapture shared] rememberContext:req];
+      }
       // 累积字节走兜底表
       NSString *key = [NSString stringWithFormat:@"%p", task];
       @synchronized (gTaskBuf) {
@@ -1350,6 +1379,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
     if (!body) {
       // app 抓包超时 = 页面没开/没发 get_pc → 计入连续失败（Ajie handleNoDataCapture 语义）
       dispatch_async(self.q, ^{ [self noteCaptureFailure:NO]; });
+      dispatch_async(dispatch_get_main_queue(), ^{ ahaObserveFlush(); });   // v0.5.16：超时点把观察窗收集到的 URL 全部刷出
       ahaLog(@"i", @"等待获取数据超时，Direct PDP 兜底直调");
       ahaStep(@"任务:DirectPDP兜底");
       body = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
