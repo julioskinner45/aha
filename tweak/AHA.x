@@ -87,15 +87,7 @@ static BOOL gObsFlushed = NO;
 static void ahaObserveFlush(void) {
   if (gObsFlushed) return;
   gObsFlushed = YES;
-  // v0.5.19：哪怕全 0 也打印摘要行——0 本身就是裁决性证据
-  ahaLog(@"i", [NSString stringWithFormat:@"观察窗: 请求%ld条(虾皮%ld) 回包%ld次 JSON解析%ld次",
-         (long)gObsAny, (long)gObsShopee, (long)gObsRecv, (long)gObsJSON]);
-  NSUInteger n = gObsURLs.count;
-  for (NSUInteger i = 0; i < n; i += 4) {
-    NSRange r = NSMakeRange(i, MIN((NSUInteger)4, n - i));
-    NSString *line = [[gObsURLs subarrayWithRange:r] componentsJoinedByString:@" | "];
-    ahaLog(@"i", [NSString stringWithFormat:@"观察窗URL(%lu/%lu): %@", (unsigned long)(i + r.length), (unsigned long)n, line]);
-  }
+  // v0.5.28 Ajie 风格精简：观察窗只做静默收集，不再刷屏（采集链路已通，诊断期结束）
   [gObsURLs removeAllObjects];
 }
 static void ahaObserveBegin(void) {
@@ -311,11 +303,6 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
       static NSInteger sNearMiss = 0;
       if (sNearMiss < 2) {
         sNearMiss++;
-        NSString *keys = [[[obj allKeys] sortedArrayUsingSelector:@selector(compare:)]
-                          componentsJoinedByString:@","];
-        if (keys.length > 120) keys = [[keys substringToIndex:120] stringByAppendingString:@"…"];
-        ahaLog(@"i", [NSString stringWithFormat:@"JSON形状: error=%@ keys=[%@]",
-               obj[@"error"], keys]);
       }
     }
     id data = obj[@"data"];
@@ -339,7 +326,6 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
     }
     dispatch_async(gPool.q, ^{ gPool.risk = NO; });
     dispatch_async(gPool.q, ^{ gPool.risk = NO; gPool.failStreak = 0; });
-    ahaLog(@"s", [NSString stringWithFormat:@"JSON形状命中(按data.item识别) item %@ shop %@", iid, sid]);
     [self storeBody:body shop:sid item:iid];
   } @catch (__unused NSException *e) { /* 非目标 JSON，静默 */ }
 }
@@ -383,7 +369,6 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
     if (![item isKindOfClass:[NSString class]] || item.length == 0 || [item isEqualToString:@"(null)"]) return;
     if (![shop isKindOfClass:[NSString class]] || shop.length == 0 || [shop isEqualToString:@"(null)"]) return;
     dispatch_async(gPool.q, ^{ gPool.risk = NO; gPool.failStreak = 0; });
-    ahaLog(@"s", [NSString stringWithFormat:@"delegate 通道抓到 get_pc 回包 item %@ shop %@", item, shop]);
     [self storeBody:body shop:shop item:item];
   } @catch (__unused NSException *e) { /* 静默 */ }
 }
@@ -627,14 +612,12 @@ static BOOL ahaTryRouteInvokes(NSArray *routes) {
     if ([nav respondsToSelector:navSel]) {
       ahaStep(@"导航:navigate 调用");
       if (ahaInvoke(nav, navSel, @[vc, path, [NSNull null], [NSNull null]], @"navigate")) {
-        ahaLog(@"i", [NSString stringWithFormat:@"route#%lu 命中: %@", (unsigned long)idx, route]);
-        return YES;
+        return YES;   // v0.5.28 精简：命中不再刷日志
       }
     }
     if ([nav respondsToSelector:pushSel]) {
       ahaStep(@"导航:push 调用");
       if (ahaInvoke(nav, pushSel, @[vc, path, [NSNull null], [NSNull null]], @"push")) {
-        ahaLog(@"i", [NSString stringWithFormat:@"route#%lu 命中(push): %@", (unsigned long)idx, route]);
         return YES;
       }
     }
@@ -676,7 +659,6 @@ static void ahaPopToRootIfNeeded(void) {
   if (nc && nc.viewControllers.count > 1) {
     ahaStep(@"导航:回根");
     [nc popToRootViewControllerAnimated:NO];
-    ahaLog(@"i", @"先回到首页再跳商品页");
   }
 }
 
@@ -709,14 +691,6 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
   if (isPdp) {
     [[AHACapture shared] rememberContext:request];
     [[AHACapture shared] rememberPdpURL:u];   // v0.5.24：app 真实 pdp/get URL，超时后重放用它
-    // v0.5.20：PDP 请求所在会话的 delegate——它若没被钩住，回包就整个看不见
-    static NSInteger sSessLog = 0;
-    if (sSessLog < 3) {
-      sSessLog++;
-      ahaLog(@"i", [NSString stringWithFormat:@"PDP请求(H通道) 经会话 delegate=%@",
-             ahaSessDelegateCls((NSURLSession *)self)]);
-    }
-    ahaLog(@"i", @"get_pc 请求已发出（completionHandler 通道）");   // v0.5.15 诊断：证明请求真的发出去了
   }
   if (!isPdp || !handler) return %orig;
   NSURLRequest *reqCopy = [request copy];
@@ -735,13 +709,6 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
     NSURLRequest *req = [NSURLRequest requestWithURL:URL];
     [[AHACapture shared] rememberContext:req];
     [[AHACapture shared] rememberPdpURL:u];   // v0.5.24
-    static NSInteger sSessLog2 = 0;
-    if (sSessLog2 < 3) {
-      sSessLog2++;
-      ahaLog(@"i", [NSString stringWithFormat:@"PDP请求(H通道) 经会话 delegate=%@",
-             ahaSessDelegateCls((NSURLSession *)self)]);
-    }
-    ahaLog(@"i", @"get_pc 请求已发出（completionHandler 通道）");   // v0.5.15 诊断
     return %orig(URL, ^(NSData *d, NSURLResponse *r, NSError *e) {
       ahaObserveRecv();
       [[AHACapture shared] inspectData:d response:r request:req error:e];
@@ -839,13 +806,10 @@ static void ahaSwizzleDelegate(id delegate) {
       if (origDone) @synchronized (gOrigDoneDict) { gOrigDoneDict[cn] = [NSValue valueWithPointer:origDone]; }
     }
 
-    // 登记日志（上限 20，防第三方 SDK 刷屏）
+    // v0.5.28 精简：装钩登记不再刷日志（cn/way 仅留作登记标记）
     static NSInteger sSwizzleLog = 0;
-    NSString *way = shpWay ? @"shp自家回调" : @"URLSession回调";
-    if (sSwizzleLog < 20) {
-      sSwizzleLog++;
-      ahaLog(@"i", [NSString stringWithFormat:@"会话 delegate=%@ 钩%@", cn, way]);
-    }
+    sSwizzleLog += shpWay ? 1 : 0;
+    (void)sSwizzleLog;
   } @catch (__unused NSException *e) { /* 静默 */ }
 }
 
@@ -971,12 +935,7 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
       }
     }
     if (bufData.length == 0) return;
-    // v0.5.15 诊断：shp 通道没有 URL 可判，用前 2 条证明通道本身活着（不刷屏）
-    static int sShpAlive = 0;
-    if (!isTask && sShpAlive < 2) {
-      sShpAlive++;
-      ahaLog(@"i", [NSString stringWithFormat:@"shp 自家通道收到回包 %lu 字节", (unsigned long)bufData.length]);
-    }
+    // v0.5.28 精简：shp 通道存活探针日志移除
     NSString *u = @"";
     NSURLRequest *req = nil;
     if (isTask) {
@@ -1083,9 +1042,10 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
     df.dateFormat = @"HH:mm:ss";
   });
   NSString *line = [NSString stringWithFormat:@"[%@] %@", [df stringFromDate:[NSDate date]], msg ?: @""];
+  if (line.length > 160) line = [[line substringToIndex:160] stringByAppendingString:@"…"];
   @synchronized (_logs) {
     [_logs addObject:line];
-    if (_logs.count > 250) [_logs removeObjectsInRange:NSMakeRange(0, _logs.count - 250)];
+    if (_logs.count > 120) [_logs removeObjectsInRange:NSMakeRange(0, _logs.count - 120)];   // v0.5.28 精简：120 行
   }
   ahaRefreshUI();
 }
@@ -1409,8 +1369,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
                 ? [j[@"waitMs"] doubleValue] / 1000.0 : 0;
           }
           self.taskLine = @"";
-          ahaLog(@"i", [NSString stringWithFormat:@"池子暂无单，%.0f 秒后再领", wait]);
-          ahaRefreshUI();
+          ahaRefreshUI();   // v0.5.28 精简：空池不再刷日志（taskLine 已清空）
           [self scheduleNext:wait];
           return;
         }
@@ -1504,10 +1463,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
           dispatch_get_main_queue(), ^{
         UIViewController *after = ahaResolvedTopVC();
         if (after && after != before) {
-          // v0.5.19：跳到的页面类名——裁决「PDP VC 真开了但没发请求」还是「开成了别的页面」
-          ahaLog(@"i", [NSString stringWithFormat:@"跳转成功 item %@ 页面=%@",
-                 itemId, NSStringFromClass([after class])]);
-          ahaObserveBegin();      // 观察窗只计数（不上日志）
+          ahaObserveBegin();      // v0.5.28 精简：跳转成功不再刷日志（观察窗照常开启）
           return;
         }
         // route「调用成功」但页面没动 → 商品直开三连 → 再验证 → UL 兜底
@@ -1523,8 +1479,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
             dispatch_get_main_queue(), ^{
           UIViewController *after2 = ahaResolvedTopVC();
           if (after2 && after2 != before) {
-            ahaLog(@"i", [NSString stringWithFormat:@"跳转成功 item %@（商品直开）页面=%@",
-                   itemId, NSStringFromClass([after2 class])]);
+            // v0.5.28 精简：商品直开成功不再刷日志
           } else {
             ahaLog(@"w", @"内路由无效，改用链接跳转");
             ahaOpenUniversalLink(shopId, itemId, taskUrl);
@@ -1668,11 +1623,14 @@ static void ahaLog(NSString *lv, NSString *msg) {
           else if (([raw containsString:@"已保存"] || [raw containsString:@"success"])
                    && ![codeTxt isEqualToString:@"ERROR"]) ok = YES;
         }
-        ahaLog(ok ? @"s" : @"i",
-            [NSString stringWithFormat:@"#%@ 聚星直传%@", taskId,
-              ok ? @"成功" : [NSString stringWithFormat:@"失败(code=%@ msg=%@ raw=%@)，转中枢代交", codeTxt, msgTxt, rawHead]]);
-        if (ok) [self markOk:taskId via:@"聚星直传"];
-        else [self hubSubmit:taskId taskUrl:taskUrl result:result];
+        if (ok) {
+          // v0.5.28 合并成一行 + 带回包原文（对账聚星完成数用：93 vs 79 差异取证）
+          [self markOk:taskId via:@"聚星直传" resp:rawHead];
+        } else {
+          ahaLog(@"w", [NSString stringWithFormat:@"#%@ 聚星直传失败(code=%@ msg=%@ raw=%@)，转中枢代交",
+                 taskId, codeTxt, msgTxt, rawHead]);
+          [self hubSubmit:taskId taskUrl:taskUrl result:result];
+        }
       });
     }] resume];
   } else {
@@ -1687,7 +1645,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
               @"profileId": self.cfg[@"pid"] ?: @"" }
       done:^(NSDictionary *j, NSError *e) {
     dispatch_async(self.q, ^{
-      if (j && [j[@"ok"] boolValue]) [self markOk:taskId via:@"中枢代交"];
+      if (j && [j[@"ok"] boolValue]) [self markOk:taskId via:@"中枢代交" resp:@""];
       else {
         ahaLog(@"e", [NSString stringWithFormat:@"上传失败：%@（任务回池）",
             j[@"error"] ?: (e.localizedDescription ?: @"未知")]);
@@ -1702,10 +1660,12 @@ static void ahaLog(NSString *lv, NSString *msg) {
   }];
 }
 
-- (void)markOk:(NSString *)taskId via:(NSString *)via {
+- (void)markOk:(NSString *)taskId via:(NSString *)via resp:(NSString *)resp {
   self.ok++;
   self.taskLine = @"";
-  ahaLog(@"s", [NSString stringWithFormat:@"单子 %@ 已交（%@），累计成功 %ld", taskId, via, (long)self.ok]);
+  // v0.5.28 Ajie 风格：成单一行 + 直传时带聚星回包原文（截 80 字，对账用）
+  ahaLog(@"s", [NSString stringWithFormat:@"成 %ld｜%@ 已交（%@）%@", (long)self.ok, taskId, via,
+         resp.length ? [NSString stringWithFormat:@" 回包:%@", resp] : @""]);
   ahaRefreshUI();
   // 聚星直传成功必须回执中枢记账（status=ok → 任务置 done + submitted+1）；
   // 中枢代交路径由 /api/pool/submit 自己记账，互斥不重复计
@@ -1841,7 +1801,7 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   if (y < 0 || y + h > scr.size.height) y = scr.size.height * 0.10;
 
   AHAPanel *p = [[AHAPanel alloc] initWithFrame:CGRectMake(x, y, w, h)];
-  p.backgroundColor = AhaColor(16, 18, 24, 0.97);
+  p.backgroundColor = AhaColor(16, 18, 24, 0.62);   // v0.5.28 半透明（用户指定，Ajie 同款质感）
   p.layer.cornerRadius = 14;
   p.clipsToBounds = YES;
   p.layer.borderWidth = 1;
@@ -1850,7 +1810,7 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
 
   // header（拖动区 + 设置 + 收起）
   UIView *hd = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 40)];
-  hd.backgroundColor = AhaColor(28, 34, 48, 1);
+  hd.backgroundColor = AhaColor(28, 34, 48, 0.72);
   self.header = hd;
   [p addSubview:hd];
   self.ttl = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, w - 90, 40)];
@@ -2138,14 +2098,15 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
     self.startBtn.backgroundColor = AhaColor(34, 170, 90, 1);
   }
   self.miniInfo.text = [NSString stringWithFormat:@"成 %ld", (long)gPool.ok];
+  // v0.5.28 日志窗渲染加固：每次都写文本 + 布局后滚底（修「日志消失」：旧版只在
+  // 行数>0 且内容变化时才写，长文本+高频刷新下 UITextView 偶发滚出空白区不回来）
   NSArray *lines = gPool.logLines;
-  if (lines.count) {
-    NSString *txt = [lines componentsJoinedByString:@"\n"];
-    if (![txt isEqualToString:self.logView.text]) {   // 内容没变不重排（修日志乱跳）
-      self.logView.text = txt;
-      [self.logView scrollRangeToVisible:NSMakeRange(txt.length, 0)];
-    }
-  }
+  NSString *txt = [lines componentsJoinedByString:@"\n"];
+  self.logView.text = txt;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [self.logView layoutIfNeeded];
+    [self.logView scrollRangeToVisible:NSMakeRange(self.logView.text.length, 0)];
+  });
 }
 
 @end
