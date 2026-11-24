@@ -283,6 +283,44 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
   return out;
 }
 
+// —— Ajie inspectCapturedData 的十字段门（0x37c04 逐指令复刻）：
+// data.item（或 data.item_data.item）里 models/tier_variations/price/price_min/price_max/
+// stock/description/images/item_rating/shop_detailed 至少 8 个非空（汇编 cmp #2 cset hi=最多缺2）。
+// 不合格 = 商品页其它 pdp 端点回包/错误回包——交上去聚星受理但下游审核不记完成（今日 80% 完成率的根因）
+static BOOL ahaPdpBodyValid(NSString *body) {
+  if (body.length < 100) return NO;
+  NSData *d = [body dataUsingEncoding:NSUTF8StringEncoding];
+  id o = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+  if (![o isKindOfClass:[NSDictionary class]]) return NO;
+  id data = o[@"data"];
+  if (![data isKindOfClass:[NSDictionary class]]) return NO;
+  id item = data[@"item"];
+  if (![item isKindOfClass:[NSDictionary class]]) {
+    id idd = data[@"item_data"];
+    item = [idd isKindOfClass:[NSDictionary class]] ? idd[@"item"] : nil;
+    if (![item isKindOfClass:[NSDictionary class]]) return NO;
+  }
+  static NSArray *fields; static dispatch_once_t onceT;
+  dispatch_once(&onceT, ^{
+    fields = @[@"models", @"tier_variations", @"price", @"price_min", @"price_max",
+               @"stock", @"description", @"images", @"item_rating", @"shop_detailed"];
+  });
+  NSInteger have = 0;
+  for (NSString *f in fields) {
+    id v = item[f];
+    if (v && ![v isKindOfClass:[NSNull class]]) have++;
+  }
+  return have >= 8;
+}
+
+// 真商品回包但字段不全 → 上限 3 条日志（防刷屏），丢弃不入库
+static void ahaBadBodyLog(NSString *body, NSString *shop, NSString *item) {
+  static NSInteger sBad = 0;
+  if (sBad >= 3) return;
+  sBad++;
+  ahaLog(@"w", [NSString stringWithFormat:@"PDP回包字段不全，丢弃（%@/%@）", shop, item]);
+}
+
 - (NSDictionary *)contextCopy {
   @synchronized (self) { return [_ctx copy]; }
 }
@@ -322,6 +360,7 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
     }
     dispatch_async(gPool.q, ^{ gPool.risk = NO; });
     dispatch_async(gPool.q, ^{ gPool.risk = NO; gPool.failStreak = 0; });
+    if (!ahaPdpBodyValid(body)) { ahaBadBodyLog(body, sid, iid); return; }   // v0.5.31 十字段门
     [self storeBody:body shop:sid item:iid];
   } @catch (__unused NSException *e) { /* 非目标 JSON，静默 */ }
 }
@@ -365,6 +404,7 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
     if (![item isKindOfClass:[NSString class]] || item.length == 0 || [item isEqualToString:@"(null)"]) return;
     if (![shop isKindOfClass:[NSString class]] || shop.length == 0 || [shop isEqualToString:@"(null)"]) return;
     dispatch_async(gPool.q, ^{ gPool.risk = NO; gPool.failStreak = 0; });
+    if (!ahaPdpBodyValid(body)) { ahaBadBodyLog(body, shop, item); return; }   // v0.5.31 十字段门：query 有参数≠回包合格
     [self storeBody:body shop:shop item:item];
   } @catch (__unused NSException *e) { /* 静默 */ }
 }
@@ -1572,8 +1612,10 @@ static void ahaLog(NSString *lv, NSString *msg) {
     dispatch_semaphore_signal(sem);
   }] resume];
   dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(22 * NSEC_PER_SEC)));
-  if (out.length > 100) [[AHACapture shared] storeBody:out shop:shopId item:itemId];
-  else out = nil;
+  if (out.length > 100) {
+    if (ahaPdpBodyValid(out)) [[AHACapture shared] storeBody:out shop:shopId item:itemId];
+    else { ahaLog(@"w", @"直调回包字段不全，不提交"); out = nil; }   // v0.5.31 十字段门
+  } else out = nil;
   return out;
 }
 
