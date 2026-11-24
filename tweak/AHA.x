@@ -770,8 +770,15 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
 + (id)JSONObjectWithData:(NSData *)data options:(NSUInteger)opts error:(NSError **)error {
   id obj = %orig;
   if (gObserveUntil && [gObserveUntil compare:[NSDate date]] == NSOrderedAscending) gObsJSON++; // v0.5.18
-  if ([obj isKindOfClass:[NSDictionary class]]) {
+  // v0.5.35 防递归（进详情闪退根因）：v0.5.31 十字段门 ahaPdpBodyValid 内部调
+  // JSONObjectWithData → 本钩再次触发 → inspectJSON → 门 → 又解析 → 无限递归 →
+  // 栈溢出 SIGSEGV（只在回包含 data.item 的商品页触发，故「进详情必闪退」）。
+  // 线程级守卫：inspectJSON 执行期间，本线程的所有解析直接透传，不再回进钩子。
+  static __thread BOOL tInJSON = NO;
+  if ([obj isKindOfClass:[NSDictionary class]] && !tInJSON) {
+    tInJSON = YES;
     @try { [[AHACapture shared] inspectJSON:obj]; } @catch (__unused NSException *e) { /* 非目标 */ }
+    tInJSON = NO;
   }
   return obj;
 }
