@@ -117,6 +117,7 @@ static void ahaObserveURL(NSString *u) {
 }
 // v0.5.28：诊断期结束，会话 delegate 类名探针已删（采集链路已通）
 static void ahaRefreshUI(void);                           // 主线程刷面板
+static void ahaStep(NSString *tag);                       // v0.5.34 前置声明（钩子门面包屑在定义之前调用）
 
 #pragma mark - 池客户端（接口声明）
 
