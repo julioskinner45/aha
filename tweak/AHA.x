@@ -1572,7 +1572,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
       ahaRefreshUI();
       ahaStep(@"任务:提交");
       ahaLog(@"i", @"提交中");   // v0.5.30 四状态：抢单成功/进入详情成功/提交中/提交成功
-      [self submit:taskId taskUrl:pcUrl result:body jxServer:jxServer token:subTok];
+      [self submit:taskId taskUrl:pcUrl result:body itemId:itemId acct:acct jxServer:jxServer token:subTok];
     });
   });
 }
@@ -1619,8 +1619,26 @@ static void ahaLog(NSString *lv, NSString *msg) {
   return out;
 }
 
+// —— v0.5.32 第二刀：Ajie 设备号同款——稳定 device_id（UserDefaults 持久化），
+// device_id 与 fingerprint_key 共用同一值（Ajie 0x34f38~0x34fd8 两次取 deviceID 的实测结构）
+static NSString *ahaDeviceID(void) {
+  static NSString *did = nil;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    NSString *k = @"aha_device_id";
+    did = [[NSUserDefaults standardUserDefaults] stringForKey:k];
+    if (did.length == 0) {
+      did = [[NSUUID UUID] UUIDString];
+      [[NSUserDefaults standardUserDefaults] setObject:did forKey:k];
+    }
+  });
+  return did;
+}
+static NSString *ahaNewUuid(void) { return [[NSUUID UUID] UUIDString]; }
+
 // —— 提交：优先聚星直传（省跨境流量），失败回退中枢代交 ——
 - (void)submit:(NSString *)taskId taskUrl:(NSString *)taskUrl result:(NSString *)result
+        itemId:(NSString *)itemId acct:(NSString *)acct
       jxServer:(NSString *)jxServer token:(NSString *)token {
   if (jxServer.length > 8 && token.length > 8) {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
@@ -1629,8 +1647,18 @@ static void ahaLog(NSString *lv, NSString *msg) {
     req.timeoutInterval = 60;
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     [req setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+    // v0.5.32 报文字段 1:1 对齐 Ajie submitCapturedJSONString（0x34a00~0x352a0 实测取值）：
+    // source='ios_submit' platform='ios' device_type='ios' submit_id=任务号
+    // task_id/deal_id=任务号 trace_id=每次新UUID item_id=商品号
+    // username/accountId=子账号 token=子账号token device_id=fingerprint_key=稳定设备号
     req.HTTPBody = [NSJSONSerialization dataWithJSONObject:
-        @{ @"appVersion": @"vv2", @"url": taskUrl, @"result": result } options:0 error:nil];
+        @{ @"appVersion": @"vv2", @"url": taskUrl, @"result": result,
+           @"source": @"ios_submit", @"platform": @"ios", @"device_type": @"ios",
+           @"submit_id": taskId, @"task_id": taskId, @"deal_id": taskId,
+           @"trace_id": [NSString stringWithFormat:@"tr_%@", ahaNewUuid()],
+           @"item_id": itemId, @"username": acct, @"accountId": acct, @"token": token,
+           @"device_id": ahaDeviceID(), @"fingerprint_key": ahaDeviceID(),
+           @"bundle_id": @"com.aha.mobile" } options:0 error:nil];
     static NSURLSession *sess = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
