@@ -120,6 +120,11 @@ static void ahaObserveURL(NSString *u) {
   if (path.length > 130) path = [[path substringToIndex:130] stringByAppendingString:@"…"];
   if (![gObsURLs containsObject:path] && gObsURLs.count < 24) [gObsURLs addObject:path];
 }
+// v0.5.20：请求所在会话的 delegate 类名——裁决回包黑洞在哪一层
+static NSString *ahaSessDelegateCls(NSURLSession *sess) {
+  @try { id d = sess.delegate; return d ? NSStringFromClass([d class]) : @"(无delegate)"; }
+  @catch (__unused NSException *e) { return @"?"; }
+}
 static void ahaRefreshUI(void);                           // 主线程刷面板
 
 #pragma mark - 池客户端（接口声明）
@@ -676,10 +681,17 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
     completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))handler {
   NSString *u = request.URL.absoluteString ?: @"";
-  ahaObserveURL(u);
+  ahaObserveURL([@"H:" stringByAppendingString:u]);   // v0.5.20：H=completionHandler 通道
   BOOL isPdp = ([u rangeOfString:kPdpMark].location != NSNotFound);
   if (isPdp) {
     [[AHACapture shared] rememberContext:request];
+    // v0.5.20：PDP 请求所在会话的 delegate——它若没被钩住，回包就整个看不见
+    static NSInteger sSessLog = 0;
+    if (sSessLog < 3) {
+      sSessLog++;
+      ahaLog(@"i", [NSString stringWithFormat:@"PDP请求(H通道) 经会话 delegate=%@",
+             ahaSessDelegateCls((NSURLSession *)self)]);
+    }
     ahaLog(@"i", @"get_pc 请求已发出（completionHandler 通道）");   // v0.5.15 诊断：证明请求真的发出去了
   }
   if (!isPdp || !handler) return %orig;
@@ -693,11 +705,17 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
 - (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)URL
     completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))handler {
   NSString *u = URL.absoluteString ?: @"";
-  ahaObserveURL(u);
+  ahaObserveURL([@"H:" stringByAppendingString:u]);   // v0.5.20：H=completionHandler 通道
   BOOL isPdp = ([u rangeOfString:kPdpMark].location != NSNotFound);
   if (isPdp) {
     NSURLRequest *req = [NSURLRequest requestWithURL:URL];
     [[AHACapture shared] rememberContext:req];
+    static NSInteger sSessLog2 = 0;
+    if (sSessLog2 < 3) {
+      sSessLog2++;
+      ahaLog(@"i", [NSString stringWithFormat:@"PDP请求(H通道) 经会话 delegate=%@",
+             ahaSessDelegateCls((NSURLSession *)self)]);
+    }
     ahaLog(@"i", @"get_pc 请求已发出（completionHandler 通道）");   // v0.5.15 诊断
     return %orig(URL, ^(NSData *d, NSURLResponse *r, NSError *e) {
       ahaObserveRecv();
@@ -709,11 +727,20 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
 }
 // v0.5.19：delegate 式会话（无 completionHandler）的发送此前完全隐形——只观察不包裹
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
-  ahaObserveURL(request.URL.absoluteString ?: @"");
+  NSString *u = request.URL.absoluteString ?: @"";
+  ahaObserveURL([@"D:" stringByAppendingString:u]);   // v0.5.20：D=delegate 式通道
+  if (u.length && [u rangeOfString:kPdpMark].location != NSNotFound) {
+    static NSInteger sSessLog3 = 0;
+    if (sSessLog3 < 3) {
+      sSessLog3++;
+      ahaLog(@"i", [NSString stringWithFormat:@"PDP请求(D通道) 经会话 delegate=%@",
+             ahaSessDelegateCls((NSURLSession *)self)]);
+    }
+  }
   return %orig;
 }
 - (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)URL {
-  ahaObserveURL(URL.absoluteString ?: @"");
+  ahaObserveURL([@"D:" stringByAppendingString:URL.absoluteString ?: @""]);
   return %orig;
 }
 %end
@@ -796,11 +823,12 @@ static void ahaSwizzleDelegate(id delegate) {
       MSHookMessageEx(cls, selDone, (IMP)ahaDelegateDidComplete, &origDone);
       if (origDone) @synchronized (gOrigDoneDict) { gOrigDoneDict[cn] = [NSValue valueWithPointer:origDone]; }
     }
-    // v0.5.18：所有会话 delegate 都登记（前 6 条封顶，防刷屏）——
-    // 一条都没有 = 虾皮的会话在我们 %ctor 之前就建好了 = delegate 通道整体失明
+    // v0.5.20：所有会话 delegate 都登记（上限 20）——
+    // v0.5.18 实测 6 条上限全是第三方 SDK（Firebase/AppsFlyer/Alamofire），
+    // 虾皮自家主会话的 delegate 被截掉看不见，无法裁决回包黑洞在哪层
     static NSInteger sSwizzleLog = 0;
     NSString *way = shpWay ? @"shp自家回调" : @"URLSession回调";
-    if (sSwizzleLog < 6) {
+    if (sSwizzleLog < 20) {
       sSwizzleLog++;
       ahaLog(@"i", [NSString stringWithFormat:@"会话 delegate=%@ 钩%@", cn, way]);
     }
