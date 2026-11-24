@@ -343,6 +343,7 @@ static void ahaBadBodyLog(NSString *body, NSString *shop, NSString *item) {
     if (![data isKindOfClass:[NSDictionary class]]) return;
     id item = data[@"item"];
     if (![item isKindOfClass:[NSDictionary class]]) return;
+    ahaStep(@"钩:JSON门");   // v0.5.34 诊断面包屑：真商品回包进门前
     NSString *iid  = [NSString stringWithFormat:@"%@", item[@"item_id"] ?: item[@"itemid"] ?: @""];
     NSString *sid  = [NSString stringWithFormat:@"%@", item[@"shop_id"] ?: item[@"shopid"] ?: @""];
     if (iid.length == 0 || sid.length == 0 || [iid isEqualToString:@"(null)"] || [sid isEqualToString:@"(null)"]) return;
@@ -401,6 +402,7 @@ static void ahaBadBodyLog(NSString *body, NSString *shop, NSString *item) {
         }
       }
     }
+    if (u.length && [u rangeOfString:kGetPcMark].location != NSNotFound) ahaStep(@"钩:RAW门");   // v0.5.34 诊断面包屑
     if (![item isKindOfClass:[NSString class]] || item.length == 0 || [item isEqualToString:@"(null)"]) return;
     if (![shop isKindOfClass:[NSString class]] || shop.length == 0 || [shop isEqualToString:@"(null)"]) return;
     dispatch_async(gPool.q, ^{ gPool.risk = NO; gPool.failStreak = 0; });
@@ -2346,6 +2348,7 @@ static void ahaReportLastCrash(void) {
     %init(gNetSession);        // sessionWithConfiguration 元类钩 → delegate 挂钩（Ajie 0x41d7c 同款）
   }
   gPool = [AHAPool shared];
+  if (!gPure) ahaInstallCrashCatcher();   // v0.5.34：装回崩溃捕获器（诊断进详情闪退，根因下次启动面板直接显示）
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
       dispatch_get_main_queue(), ^{
     gUI = [AHAUI shared];
