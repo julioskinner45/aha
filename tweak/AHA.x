@@ -64,6 +64,9 @@ static NSString *const kGetPcTpl  = @"https://shopee.tw/api/v4/pdp/get_pc?displa
 
 static AHAPool *gPool = nil;
 static AHAUI   *gUI   = nil;
+// v0.5.22 纯净模式开关（aha_pure_v1，默认开）：二分定位「装上即全网死」——
+// 纯净 = 不装任何网络钩子 + 不装崩溃捕获器；完整 = 功能全装。切换后需重启虾皮生效
+static BOOL gPure = YES;
 
 static void ahaLog(NSString *lv, NSString *msg);          // 写日志 + 面板滚动
 // 观察窗：打开商品页后 30s 内记录 app 发出的每条虾皮请求（诊断「页面开了但没回包」）
@@ -677,6 +680,7 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
 
 #pragma mark - 观察钩子（Ajie 同款：包 completionHandler，不碰 protocolClasses）
 
+%group gNetCapture
 %hook NSURLSession
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
     completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))handler {
@@ -744,7 +748,9 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
   return %orig;
 }
 %end
+%end // gNetCapture
 
+%group gNetJSON
 // —— Ajie 1:1 第三钩：NSJSONSerialization（万能兜底）——
 // 虾皮任何网络栈（delegate 式会话/自研封装）拿到回包后都要用系统 JSON 解析器，
 // 在这里按形状识别 get_pc 回包，delegate 会话也能抓到（Ajie 实证做法）
@@ -758,6 +764,7 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
   return obj;
 }
 %end
+%end // gNetJSON
 
 #pragma mark - Ajie 1:1 第四钩（v0.5.12 = 反汇编逐字对齐版）
 
@@ -966,6 +973,7 @@ __attribute__((unused)) static void ahaDelegateDidComplete(id self, SEL _cmd, id
   } @catch (__unused NSException *e) { /* 静默 */ }
 }
 
+%group gNetSession
 %hook NSURLSession
 + (NSURLSession *)sessionWithConfiguration:(NSURLSessionConfiguration *)configuration
     delegate:(id)delegate delegateQueue:(NSOperationQueue *)queue {
@@ -974,6 +982,7 @@ __attribute__((unused)) static void ahaDelegateDidComplete(id self, SEL _cmd, id
   return s;
 }
 %end
+%end // gNetSession
 
 #pragma mark - 池客户端（实现：登录 → 领单 → 浏览/截包 → 直传/代交）
 
@@ -1142,6 +1151,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
 
 // —— 开始 / 停止 ——
 - (void)startLoop {
+  if (gPure) { ahaLog(@"w", @"当前是纯净模式（无采集钩子），请先到设置⚙切到完整模式并重启虾皮"); ahaRefreshUI(); return; }
   if (!self.connected) { [self connect:^{ [self beginRun]; }]; return; }
   [self beginRun];
 }
@@ -1910,7 +1920,9 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
     [wp helloTick];
   }];
 
-  ahaLog(@"s", @"AHA 已注入（被动观察模式，不改任何请求）");
+  ahaLog(@"s", gPure
+      ? @"AHA 已注入（纯净模式：无网络钩子，设置⚙里可切完整模式）"
+      : @"AHA 已注入（完整模式：网络钩子已装）");
 }
 
 - (void)fieldsChanged {
@@ -1977,6 +1989,15 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
         [NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
     [gPool saveCfg];
     if ([gPool.cfg[@"couponAcct"] length]) ahaLog(@"i", @"优惠券检测已开启：领取任务前先检测优惠券数据");
+  }]];
+  // v0.5.22 纯净/完整模式切换（二分定位「装上即全网死」，切换后重启虾皮生效）
+  [a addAction:[UIAlertAction actionWithTitle:(gPure ? @"切换到完整模式" : @"切换到纯净模式")
+      style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *act) {
+    BOOL want = !gPure;
+    [[NSUserDefaults standardUserDefaults] setObject:@(want) forKey:@"aha_pure_v1"];
+    ahaLog(@"w", want
+        ? @"已切到完整模式（网络钩子将装上）：杀掉虾皮进程重开生效"
+        : @"已切到纯净模式（卸掉所有网络钩子）：杀掉虾皮进程重开生效");
   }]];
   [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
   UIViewController *top = self.win.rootViewController;
@@ -2204,14 +2225,22 @@ static void ahaReportLastCrash(void) {
 }
 
 %ctor {
-  ahaInstallCrashCatcher();  // 最先装，任何闪退都要留下证据
-  %init(_ungrouped);         // 没这行，所有钩子都不生效（v0.2.0 血坑）
-  // 6 秒后重装崩溃 handler：Shopee app 启动时会装自己的崩溃处理器把我们覆盖掉
-  //（v0.5.5 崩了没日志的根因），覆盖回去才能持续抓到段错误证据
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
-      dispatch_get_main_queue(), ^{
-    ahaInstallCrashCatcher();
-  });
+  // v0.5.22 纯净模式开关：默认纯净（无网络钩子+无崩溃捕获器），设置里可切完整模式。
+  // 诊断逻辑：纯净模式下虾皮网络若恢复 → 凶手在网络钩子组；若仍死 → 在 UI/框架本身
+  id pv = [[NSUserDefaults standardUserDefaults] objectForKey:@"aha_pure_v1"];
+  gPure = pv ? [pv boolValue] : YES;
+  if (!gPure) {
+    ahaInstallCrashCatcher();  // 最先装，任何闪退都要留下证据
+    %init(gNetCapture);        // 三个网络钩子组（completionHandler/JSON/会话 delegate 登记）
+    %init(gNetJSON);
+    %init(gNetSession);
+    // 6 秒后重装崩溃 handler：Shopee app 启动时会装自己的崩溃处理器把我们覆盖掉
+    //（v0.5.5 崩了没日志的根因），覆盖回去才能持续抓到段错误证据
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+      ahaInstallCrashCatcher();
+    });
+  }
   gPool = [AHAPool shared];
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
       dispatch_get_main_queue(), ^{
