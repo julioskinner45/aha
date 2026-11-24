@@ -1030,8 +1030,19 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
     if (!_cfg[@"server"]) _cfg[@"server"] = @"https://140.235.98.220:29690";
     if (!_cfg[@"pid"]) _cfg[@"pid"] = [NSString stringWithFormat:@"phone-%@",
         [[NSUUID UUID].UUIDString substringToIndex:4].lowercaseString];
+    /* v0.5.38 统计持久化：重进 App 不清零，只有用户点「清零」才清（用户令） */
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    self.taken = (NSInteger)[d integerForKey:@"aha_stat_taken"];
+    self.ok    = (NSInteger)[d integerForKey:@"aha_stat_ok"];
   }
   return self;
+}
+
+/* v0.5.38 计数落盘（taken/ok 变化处调用；NSUserDefaults 每单一次写入，量小无压力） */
+- (void)persistStats {
+  NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+  [d setInteger:(NSInteger)self.taken forKey:@"aha_stat_taken"];
+  [d setInteger:(NSInteger)self.ok    forKey:@"aha_stat_ok"];
 }
 
 - (dispatch_queue_t)q { return _q; }
@@ -1066,7 +1077,7 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
   @synchronized (_logs) { return [_logs copy]; }
 }
 - (void)clearLog { @synchronized (_logs) { [_logs removeAllObjects]; } }
-- (void)resetCounters { self.taken = 0; self.ok = 0; self.taskLine = @""; }
+- (void)resetCounters { self.taken = 0; self.ok = 0; self.taskLine = @""; [self persistStats]; }
 
 - (void)appendLog:(NSString *)lv msg:(NSString *)msg {
   // Ajie 风格：纯文本消息，时间用 [] 框住（用户指定）；不再用 ✔✖⚠ 前缀
@@ -1423,6 +1434,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
           return;
         }
         self.taken++;
+        [self persistStats];   /* v0.5.38 重进不清零 */
         @try { [self handleTask:t]; } @catch (NSException *e) {
           ahaLog(@"e", [NSString stringWithFormat:@"任务处理异常已拦截：%@ — 任务回池", e.reason]);
           self.taskLine = @"";
@@ -1739,6 +1751,7 @@ static NSString *ahaNewUuid(void) { return [[NSUUID UUID] UUIDString]; }
 
 - (void)markOk:(NSString *)taskId via:(NSString *)via resp:(NSString *)resp {
   self.ok++;
+  [self persistStats];   /* v0.5.38 重进不清零 */
   self.taskLine = @"";
   (void)taskId; (void)via; (void)resp;   // v0.5.30 精简：成功只留一行计数，回包原文不再进面板
   ahaLog(@"s", [NSString stringWithFormat:@"提交成功 %ld", (long)self.ok]);
