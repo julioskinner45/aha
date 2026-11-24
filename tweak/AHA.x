@@ -115,11 +115,7 @@ static void ahaObserveURL(NSString *u) {
   if (path.length > 130) path = [[path substringToIndex:130] stringByAppendingString:@"…"];
   if (![gObsURLs containsObject:path] && gObsURLs.count < 24) [gObsURLs addObject:path];
 }
-// v0.5.20：请求所在会话的 delegate 类名——裁决回包黑洞在哪一层
-static NSString *ahaSessDelegateCls(NSURLSession *sess) {
-  @try { id d = sess.delegate; return d ? NSStringFromClass([d class]) : @"(无delegate)"; }
-  @catch (__unused NSException *e) { return @"?"; }
-}
+// v0.5.28：诊断期结束，会话 delegate 类名探针已删（采集链路已通）
 static void ahaRefreshUI(void);                           // 主线程刷面板
 
 #pragma mark - 池客户端（接口声明）
