@@ -1365,7 +1365,9 @@ static void ahaLog(NSString *lv, NSString *msg) {
                 ? [j[@"waitMs"] doubleValue] / 1000.0 : 0;
           }
           self.taskLine = @"";
-          ahaRefreshUI();   // v0.5.28 精简：空池不再刷日志（taskLine 已清空）
+          ahaRefreshUI();
+          // v0.5.29：每一轮的状态都要显示（用户要求，Ajie 同款每步留痕）
+          ahaLog(@"i", [NSString stringWithFormat:@"无单，%.0f 秒后再领", wait]);
           [self scheduleNext:wait];
           return;
         }
@@ -1459,7 +1461,8 @@ static void ahaLog(NSString *lv, NSString *msg) {
           dispatch_get_main_queue(), ^{
         UIViewController *after = ahaResolvedTopVC();
         if (after && after != before) {
-          ahaObserveBegin();      // v0.5.28 精简：跳转成功不再刷日志（观察窗照常开启）
+          ahaLog(@"i", [NSString stringWithFormat:@"已进商品页 item %@", itemId]);   // v0.5.29：每步状态显示
+          ahaObserveBegin();
           return;
         }
         // route「调用成功」但页面没动 → 商品直开三连 → 再验证 → UL 兜底
@@ -1529,6 +1532,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
           taskId, via, (unsigned long)[body lengthOfBytesUsingEncoding:NSUTF8StringEncoding] / 1024];
       ahaRefreshUI();
       ahaStep(@"任务:提交");
+      ahaLog(@"i", [NSString stringWithFormat:@"已采集（%@），提交中", via]);   // v0.5.29
       [self submit:taskId taskUrl:pcUrl result:body jxServer:jxServer token:subTok];
     });
   });
