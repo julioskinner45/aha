@@ -1,4 +1,4 @@
-// AHA.x — Shopee app 内采集客户端 v0.5.13（导航 = Ajie 逐字复刻 + 面包屑诊断）
+// AHA.x — Shopee app 内采集客户端 v0.5.14（导航 = Ajie 逐字复刻 + 面包屑诊断）
 //
 // v0.5.6 关键改动（对照 Ajie 0.1.3 反汇编逐条对齐）：
 // v0.5.13（2026-11-24）：导航/风控/日志/验券 全面对照 Ajie 反汇编 1:1 重做——
@@ -430,25 +430,36 @@ static id ahaResolveManager(void) {
   return nil;
 }
 
-// —— 顶层 VC（Ajie topViewController 同思路）：主窗口 → root → 弹层/标签/导航栈逐层解 ——
+// —— 钻取（Ajie resolvedTopViewControllerFromController 0x21ac8 复刻）：
+// 弹层逐层解，但 UIAlertController 不钻（Ajie 0x21b58 对一个类做了 isKindOfClass
+// 探测后才钻——把弹窗当导航源 VC 传给管理器会静默无效）；导航栈用
+// visibleViewController 优先（Ajie 0x63120/0x63128 双选择器序）——
+static UIViewController *ahaDrillFrom(UIViewController *vc) {
+  if (!vc) return nil;
+  while (vc.presentedViewController &&
+         ![vc.presentedViewController isKindOfClass:[UIAlertController class]])
+    vc = vc.presentedViewController;
+  if ([vc isKindOfClass:[UITabBarController class]])
+    vc = [(UITabBarController *)vc selectedViewController] ?: vc;
+  if ([vc isKindOfClass:[UINavigationController class]])
+    vc = [(UINavigationController *)vc visibleViewController]
+         ?: [(UINavigationController *)vc topViewController] ?: vc;
+  while (vc.presentedViewController &&
+         ![vc.presentedViewController isKindOfClass:[UIAlertController class]])
+    vc = vc.presentedViewController;
+  return vc;
+}
+
 static UIViewController *ahaResolvedTopVC(void) {
   UIWindow *own = ahaOwnWin();
   UIWindow *main = nil;
   for (UIWindow *w in [UIApplication sharedApplication].windows) {
-    if (w == own || !w.rootViewController) continue;
+    if (w == own || w.hidden || !w.rootViewController || w.alpha < 0.1) continue;
     if (!main || w.isKeyWindow) main = w;
     if (w.isKeyWindow) break;
   }
   if (!main) return nil;
-  UIViewController *vc = main.rootViewController;
-  if (!vc) return nil;
-  while (vc.presentedViewController) vc = vc.presentedViewController;
-  if ([vc isKindOfClass:[UITabBarController class]])
-    vc = [(UITabBarController *)vc selectedViewController] ?: vc;
-  if ([vc isKindOfClass:[UINavigationController class]])
-    vc = [(UINavigationController *)vc topViewController] ?: vc;
-  while (vc.presentedViewController) vc = vc.presentedViewController;
-  return vc;
+  return ahaDrillFrom(main.rootViewController);
 }
 
 // —— Ajie routeBackOnce 复刻：manager 级回退（它 dylib 里的 8 个回退选择器，goBack 优先）——
@@ -496,8 +507,9 @@ static id ahaBuildPath(NSString *route) {
 }
 
 // —— 组装导航（Ajie navigateWithBTManagerToRoute: 复刻）：
-// 4 种 route 格式轮试 × navigate/push 双候选 ——
-static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
+// 4 种 route 格式轮试 × navigate/push 双候选。注意：invoke「不抛异常」≠ 页面真的跳了
+//（Ajie 的成功判定也是这样），所以调用层只负责「调了没有」，页面验证在外层做 ——
+static BOOL ahaTryRouteInvokes(NSArray *routes) {
   ahaStep(@"导航:解析管理器");
   id nav = ahaResolveManager();
   if (!nav) { ahaLog(@"w", @"跳转失败:无导航器"); return NO; }
@@ -506,13 +518,6 @@ static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
   UIViewController *vc = ahaResolvedTopVC();
   if (!vc) { ahaLog(@"w", @"跳转失败:无控制器"); return NO; }
 
-  // route 4 连（Ajie 0x241a4~0x243e0 逐条实证序完全一致）
-  NSArray *routes = @[
-    [NSString stringWithFormat:@"rn/PRODUCT_PAGE?item_id=%@&shop_id=%@", itemId, shopId],
-    [NSString stringWithFormat:@"rn/PRODUCT_PAGE?good_id=%@&shop_id=%@", itemId, shopId],
-    [NSString stringWithFormat:@"rn/PRODUCT_PAGE?shopid=%@&itemid=%@", shopId, itemId],
-    [NSString stringWithFormat:@"PRODUCT_PAGE?itemid=%@&shopid=%@", itemId, shopId],
-  ];
   SEL navSel  = NSSelectorFromString(@"navigateFromViewController:destinationPath:navigateOption:completion:");
   SEL pushSel = NSSelectorFromString(@"pushFromViewController:destinationPath:pushOption:completion:");
 
@@ -530,20 +535,21 @@ static BOOL ahaNavInApp(NSString *shopId, NSString *itemId) {
       if (ahaInvoke(nav, pushSel, @[vc, path, [NSNull null], [NSNull null]], @"push")) return YES;
     }
   }
+  return NO;
+}
 
-  // —— Ajie 兜底级（invokeRouteNavigationOnManager 0x23a44~0x23df0 实证）：
-  //    manager 自带的商品直开方法，不需要路径对象，参数 [shopID, itemID]（nil→@""）——
+// —— Ajie 兜底级（invokeRouteNavigationOnManager 0x23a44~0x23df0 实证）：
+//    manager 自带的商品直开方法，不需要路径对象，参数 [shopID, itemID]（nil→@""）——
+static BOOL ahaTryDirectOpens(NSString *shopId, NSString *itemId) {
+  id nav = ahaResolveManager();
+  if (!nav) return NO;
   NSString *shop = shopId ?: @"", *item = itemId ?: @"";
   for (NSString *m in @[@"navigateToProduct:goodID:", @"openProductPage:goodID:", @"openProduct:goodID:"]) {
     SEL s = NSSelectorFromString(m);
     if (![nav respondsToSelector:s]) continue;
     ahaStep(@"导航:商品直开");
-    if (ahaInvoke(nav, s, @[shop, item], m)) {
-      ahaLog(@"i", @"跳转成功（商品直开）");
-      return YES;
-    }
+    if (ahaInvoke(nav, s, @[shop, item], m)) return YES;
   }
-  ahaLog(@"w", @"跳转失败:路由无响应");
   return NO;
 }
 
@@ -559,10 +565,7 @@ static void ahaPopToRootIfNeeded(void) {
     if (w.isKeyWindow) break;
   }
   if (!main) return;
-  UIViewController *vc = main.rootViewController;
-  while (vc.presentedViewController) vc = vc.presentedViewController;
-  if ([vc isKindOfClass:[UITabBarController class]])
-    vc = [(UITabBarController *)vc selectedViewController] ?: vc;
+  UIViewController *vc = ahaDrillFrom(main.rootViewController);
   UINavigationController *nc = [vc isKindOfClass:[UINavigationController class]]
       ? (UINavigationController *)vc : vc.navigationController;
   if (nc && nc.viewControllers.count > 1) {
@@ -1244,29 +1247,62 @@ static void ahaLog(NSString *lv, NSString *msg) {
   ahaLog(@"s", [NSString stringWithFormat:@"领到单 #%@ [%@] item %@ shop %@", taskId, acct, itemId, shopId]);
   ahaRefreshUI();
 
-  // 导航 = Ajie openCurrentTask 0x2f7fc 时序 1:1：
-  // popToRootViewControllerIfNeeded → 0.35s → 内路由（4 route + 商品直开三连）
-  // → 失败 → Universal Link 兜底（app 内打开商品页，不是 Direct PDP——页面必须真开）
-  // 注：导航前不收弹层（Ajie 无此步骤；收弹层留给每单结束的白板自清理）
+  // 导航 = Ajie openCurrentTask 0x2f7fc 时序 1:1 + 页面真跳验证：
+  // popToRootViewControllerIfNeeded → 0.35s → 内路由（4 route × navigate/push）
+  // → 1.2s 后验证 topVC 是否真的变了（invoke 不抛异常≠页面跳了）
+  // → 没变 → 商品直开三连 → 再验证 → 全无效 → Universal Link 兜底（页面必须真开）
   dispatch_async(dispatch_get_main_queue(), ^{
     ahaPopToRootIfNeeded();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{
-      BOOL opened = NO;
+      UIViewController *before = ahaResolvedTopVC();
+      NSArray *routes = @[
+        [NSString stringWithFormat:@"rn/PRODUCT_PAGE?item_id=%@&shop_id=%@", itemId, shopId],
+        [NSString stringWithFormat:@"rn/PRODUCT_PAGE?good_id=%@&shop_id=%@", itemId, shopId],
+        [NSString stringWithFormat:@"rn/PRODUCT_PAGE?shopid=%@&itemid=%@", shopId, itemId],
+        [NSString stringWithFormat:@"PRODUCT_PAGE?itemid=%@&shopid=%@", itemId, shopId],
+      ];
+      BOOL invoked = NO;
       ahaStep(@"导航:开始");
-      @try { opened = ahaNavInApp(shopId, itemId); } @catch (NSException *e) {
+      @try { invoked = ahaTryRouteInvokes(routes); } @catch (NSException *e) {
         ahaLog(@"e", [NSString stringWithFormat:@"导航异常:%@", e.reason]);
-        opened = NO;
       }
       ahaStep(@"导航:结束");
-      if (opened) {
-        ahaLog(@"i", [NSString stringWithFormat:@"跳转成功 item %@", itemId]);
-        ahaObserveBegin();      // 观察窗只计数（不上日志）
+      if (!invoked) {
+        ahaLog(@"w", @"内路由不可用，改用链接跳转");
+        ahaOpenUniversalLink(shopId, itemId, taskUrl);
+        ahaObserveBegin();
         return;
       }
-      // 内路由全失败 → Ajie 同款 Universal Link 兜底（打开商品页让 app 自己发 get_pc）
-      ahaOpenUniversalLink(shopId, itemId, taskUrl);
-      ahaObserveBegin();
+      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+          dispatch_get_main_queue(), ^{
+        UIViewController *after = ahaResolvedTopVC();
+        if (after && after != before) {
+          ahaLog(@"i", [NSString stringWithFormat:@"跳转成功 item %@", itemId]);
+          ahaObserveBegin();      // 观察窗只计数（不上日志）
+          return;
+        }
+        // route「调用成功」但页面没动 → 商品直开三连 → 再验证 → UL 兜底
+        BOOL d = NO;
+        @try { d = ahaTryDirectOpens(shopId, itemId); } @catch (__unused NSException *e) { d = NO; }
+        if (!d) {
+          ahaLog(@"w", @"内路由无效，改用链接跳转");
+          ahaOpenUniversalLink(shopId, itemId, taskUrl);
+          ahaObserveBegin();
+          return;
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{
+          UIViewController *after2 = ahaResolvedTopVC();
+          if (after2 && after2 != before) {
+            ahaLog(@"i", [NSString stringWithFormat:@"跳转成功 item %@（商品直开）", itemId]);
+          } else {
+            ahaLog(@"w", @"内路由无效，改用链接跳转");
+            ahaOpenUniversalLink(shopId, itemId, taskUrl);
+          }
+          ahaObserveBegin();
+        });
+      });
     });
   });
 
