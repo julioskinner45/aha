@@ -159,6 +159,8 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
 @interface AHACapture : NSObject
 + (AHACapture *)shared;
 - (void)rememberContext:(NSURLRequest *)req;              // 记 pdp 请求全套头（Direct PDP 用）
+- (void)rememberPdpURL:(NSString *)u;                     // v0.5.24：记 app 真实 pdp/get URL（重放用，90s 内有效）
+- (NSString *)freshPdpURL;
 - (void)inspectData:(NSData *)data response:(NSURLResponse *)resp
             request:(NSURLRequest *)req error:(NSError *)err;
 - (void)inspectJSON:(NSDictionary *)obj;                  // Ajie 同款：NSJSONSerialization 钩子喂进来的对象
@@ -171,6 +173,8 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
 @implementation AHACapture {
   NSMutableDictionary *_bodies;   // @"shop|item" -> @{ body, at }
   NSMutableDictionary *_ctx;      // app 自己 pdp 请求头快照
+  NSString *_pdpURL;              // v0.5.24：app 真实 pdp 请求 URL
+  NSDate *_pdpURLAt;
 }
 
 + (AHACapture *)shared {
@@ -193,6 +197,19 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
   @synchronized (self) {
     [_ctx removeAllObjects];
     [_ctx addEntriesFromDictionary:h];
+  }
+}
+
+// v0.5.24：记 app 真实 pdp 请求 URL（虾皮现在用 /api/v4/pdp/get，get_pc 已是老端点被 SGW 拒）
+- (void)rememberPdpURL:(NSString *)u {
+  if (u.length == 0) return;
+  @synchronized (self) { _pdpURL = [u copy]; _pdpURLAt = [NSDate date]; }
+}
+- (NSString *)freshPdpURL {
+  @synchronized (self) {
+    if (!_pdpURL || !_pdpURLAt) return nil;
+    if (-[_pdpURLAt timeIntervalSinceNow] > 90) return nil;   // 90 秒内有效，防陈旧任务串号
+    return _pdpURL;
   }
 }
 
@@ -689,6 +706,7 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
   BOOL isPdp = ([u rangeOfString:kPdpMark].location != NSNotFound);
   if (isPdp) {
     [[AHACapture shared] rememberContext:request];
+    [[AHACapture shared] rememberPdpURL:u];   // v0.5.24：app 真实 pdp/get URL，超时后重放用它
     // v0.5.20：PDP 请求所在会话的 delegate——它若没被钩住，回包就整个看不见
     static NSInteger sSessLog = 0;
     if (sSessLog < 3) {
@@ -714,6 +732,7 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
   if (isPdp) {
     NSURLRequest *req = [NSURLRequest requestWithURL:URL];
     [[AHACapture shared] rememberContext:req];
+    [[AHACapture shared] rememberPdpURL:u];   // v0.5.24
     static NSInteger sSessLog2 = 0;
     if (sSessLog2 < 3) {
       sSessLog2++;
@@ -841,9 +860,11 @@ static void ahaDelegateDidReceiveData(id self, SEL _cmd, id module, id requestLi
       NSURLRequest *req = task.currentRequest;
       if (req) {
         ahaObserveURL(req.URL.absoluteString);            // v0.5.16：delegate 会话的请求也进观察窗
-        if (req.allHTTPHeaderFields.count &&
-            [req.URL.absoluteString rangeOfString:kPdpMark].location != NSNotFound)
-          [[AHACapture shared] rememberContext:req];
+        if ([req.URL.absoluteString rangeOfString:kPdpMark].location != NSNotFound) {
+          [[AHACapture shared] rememberPdpURL:req.URL.absoluteString];   // v0.5.24
+          if (req.allHTTPHeaderFields.count)
+            [[AHACapture shared] rememberContext:req];
+        }
       }
       // 累积字节走兜底表
       NSString *key = [NSString stringWithFormat:@"%p", task];
@@ -1113,7 +1134,8 @@ static void ahaLog(NSString *lv, NSString *msg) {
   static NSURLSession *sess = nil;
   static dispatch_once_t once;
   dispatch_once(&once, ^{
-    sess = AhaSession([NSURLSessionConfiguration defaultSessionConfiguration]);
+    // v0.5.24：default→ephemeral（cookie/缓存隔离，绝不污染 app 的共享存储）
+    sess = AhaSession([NSURLSessionConfiguration ephemeralSessionConfiguration]);
   });
   [[sess dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
     id obj = (d && !e) ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
@@ -1548,11 +1570,18 @@ static void ahaLog(NSString *lv, NSString *msg) {
   });
 }
 
-// —— Direct PDP：重放 app 上下文调 get_pc（Ajie 的核心兜底）——
+// —— Direct PDP：重放 app 上下文调商品接口（Ajie 的核心兜底）——
+// v0.5.24：优先重放 app 刚发出的真实 pdp/get URL（get_pc 已是老端点，SGW 直接 418）；
+// 90 秒内 app 发过 pdp 请求才有 fresh URL，否则回退 get_pc 模板
 - (NSString *)directFetchShop:(NSString *)shopId item:(NSString *)itemId taskUrl:(NSString *)taskUrl {
-  NSString *url = taskUrl;
-  if ([url rangeOfString:kGetPcMark].location == NSNotFound)
-    url = [NSString stringWithFormat:kGetPcTpl, itemId, shopId];
+  NSString *url = [[AHACapture shared] freshPdpURL];
+  NSString *via = url ? @"重放app真实URL" : @"get_pc模板";
+  if (!url) {
+    url = taskUrl;
+    if ([url rangeOfString:kGetPcMark].location == NSNotFound)
+      url = [NSString stringWithFormat:kGetPcTpl, itemId, shopId];
+  }
+  ahaLog(@"i", [NSString stringWithFormat:@"Direct PDP 走 %@ 重放", via]);
   NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
   req.HTTPMethod = @"GET";
   req.timeoutInterval = 20;
@@ -1598,7 +1627,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
     static NSURLSession *sess = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-      sess = AhaSession([NSURLSessionConfiguration defaultSessionConfiguration]);
+      sess = AhaSession([NSURLSessionConfiguration ephemeralSessionConfiguration]);   // v0.5.24 隔离
     });
     [[sess dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
       dispatch_async(self.q, ^{
