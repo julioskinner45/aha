@@ -671,7 +671,7 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
   [[UIApplication sharedApplication] openURL:url
     options:@{ UIApplicationOpenURLOptionUniversalLinksOnly: @YES }
     completionHandler:^(BOOL ok) {
-      ahaLog(ok ? @"i" : @"w", ok ? @"Universal Link跳转成功" : @"Universal Link被拒（不弹网页，任务照常走）");
+      ahaLog(ok ? @"i" : @"w", ok ? @"进入详情成功" : @"进入详情重试（不弹网页）");
     }];
 }
 
@@ -1346,7 +1346,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
         done:^(NSDictionary *j, NSError *e) {
       dispatch_async(self.q, ^{
         if (e) {
-          ahaLog(@"e", [NSString stringWithFormat:@"领单请求失败：%@", e.localizedDescription]);
+          ahaLog(@"e", [NSString stringWithFormat:@"抢单失败：%@", e.localizedDescription]);
           self.taskLine = @"";
           ahaRefreshUI();
           [self scheduleNext:5];
@@ -1367,7 +1367,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
           self.taskLine = @"";
           ahaRefreshUI();
           // v0.5.29：每一轮的状态都要显示（用户要求，Ajie 同款每步留痕）
-          ahaLog(@"i", [NSString stringWithFormat:@"无单，%.0f 秒后再领", wait]);
+          ahaLog(@"i", [NSString stringWithFormat:@"无单，%.0f秒后再抢", wait]);
           [self scheduleNext:wait];
           return;
         }
@@ -1409,8 +1409,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
         };
         if (shopId.length == 0) shopId = g(1).length ? g(1) : g(3);
         if (itemId.length == 0) itemId = g(2).length ? g(2) : g(4);
-        if (shopId.length && itemId.length)
-          ahaLog(@"i", [NSString stringWithFormat:@"任务缺 shop/item，已从 taskUrl 补解析：shop %@ item %@", shopId, itemId]);
+        if (shopId.length && itemId.length) { /* v0.5.30：补解析不再刷日志 */ }
       }
     }
   }
@@ -1421,7 +1420,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
       @"https://shopee.tw/api/v4/pdp/get_pc?display_model_id=0&item_id=%@&model_selection_logic=3&shop_id=%@&tz_offset_in_minutes=480&detail_level=0",
       itemId, shopId];
   ahaStep(@"任务:领到单");
-  ahaLog(@"s", [NSString stringWithFormat:@"领到单 #%@ [%@] item %@ shop %@", taskId, acct, itemId, shopId]);
+  ahaLog(@"s", @"抢单成功");
   ahaRefreshUI();
 
   // 导航 = Ajie openCurrentTask 0x2f7fc 时序 1:1 + 页面真跳验证：
@@ -1452,7 +1451,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
       }
       ahaStep(@"导航:结束");
       if (!invoked) {
-        ahaLog(@"w", @"内路由不可用，改用链接跳转");
+        ahaLog(@"w", @"进入详情重试");
         ahaOpenUniversalLink(shopId, itemId, taskUrl);
         ahaObserveBegin();
         return;
@@ -1461,7 +1460,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
           dispatch_get_main_queue(), ^{
         UIViewController *after = ahaResolvedTopVC();
         if (after && after != before) {
-          ahaLog(@"i", [NSString stringWithFormat:@"已进商品页 item %@", itemId]);   // v0.5.29：每步状态显示
+          ahaLog(@"i", @"进入详情成功");   // v0.5.30 四状态：抢单成功/进入详情成功/提交中/提交成功
           ahaObserveBegin();
           return;
         }
@@ -1469,7 +1468,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
         BOOL d = NO;
         @try { d = ahaTryDirectOpens(shopId, itemId); } @catch (__unused NSException *e) { d = NO; }
         if (!d) {
-          ahaLog(@"w", @"内路由无效，改用链接跳转");
+          ahaLog(@"w", @"进入详情重试");
           ahaOpenUniversalLink(shopId, itemId, taskUrl);
           ahaObserveBegin();
           return;
@@ -1480,7 +1479,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
           if (after2 && after2 != before) {
             // v0.5.28 精简：商品直开成功不再刷日志
           } else {
-            ahaLog(@"w", @"内路由无效，改用链接跳转");
+            ahaLog(@"w", @"进入详情重试");
             ahaOpenUniversalLink(shopId, itemId, taskUrl);
           }
           ahaObserveBegin();
@@ -1504,7 +1503,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
       // app 抓包超时 = 页面没开/没发 get_pc → 计入连续失败（Ajie handleNoDataCapture 语义）
       dispatch_async(self.q, ^{ [self noteCaptureFailure:NO]; });
       dispatch_async(dispatch_get_main_queue(), ^{ ahaObserveFlush(); });   // v0.5.16：超时点把观察窗收集到的 URL 全部刷出
-      ahaLog(@"i", @"等待获取数据超时，Direct PDP 兜底直调");
+      ahaLog(@"i", @"明细超时，直调兜底");
       ahaStep(@"任务:DirectPDP兜底");
       body = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
       via = @"DirectPDP";
@@ -1520,7 +1519,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
     });
     dispatch_async(self.q, ^{
       if (!body) {
-        ahaLog(@"w", @"15 秒没等到商品回包（页面没开/没加载完），任务回池");
+        ahaLog(@"w", @"采集超时，任务回池");
         self.taskLine = @"";
         ahaRefreshUI();
         [self api:@"/api/pool/report" method:@"POST"
@@ -1532,7 +1531,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
           taskId, via, (unsigned long)[body lengthOfBytesUsingEncoding:NSUTF8StringEncoding] / 1024];
       ahaRefreshUI();
       ahaStep(@"任务:提交");
-      ahaLog(@"i", [NSString stringWithFormat:@"已采集（%@），提交中", via]);   // v0.5.29
+      ahaLog(@"i", @"提交中");   // v0.5.30 四状态：抢单成功/进入详情成功/提交中/提交成功
       [self submit:taskId taskUrl:pcUrl result:body jxServer:jxServer token:subTok];
     });
   });
@@ -1543,13 +1542,11 @@ static void ahaLog(NSString *lv, NSString *msg) {
 // 90 秒内 app 发过 pdp 请求才有 fresh URL，否则回退 get_pc 模板
 - (NSString *)directFetchShop:(NSString *)shopId item:(NSString *)itemId taskUrl:(NSString *)taskUrl {
   NSString *url = [[AHACapture shared] freshPdpURL];
-  NSString *via = url ? @"重放app真实URL" : @"get_pc模板";
   if (!url) {
     url = taskUrl;
     if ([url rangeOfString:kGetPcMark].location == NSNotFound)
       url = [NSString stringWithFormat:kGetPcTpl, itemId, shopId];
   }
-  ahaLog(@"i", [NSString stringWithFormat:@"Direct PDP 走 %@ 重放", via]);
   NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
   req.HTTPMethod = @"GET";
   req.timeoutInterval = 20;
@@ -1568,9 +1565,9 @@ static void ahaLog(NSString *lv, NSString *msg) {
       if (hr.statusCode == 200)
         out = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
       else
-        ahaLog(@"w", [NSString stringWithFormat:@"Direct PDP 回 HTTP %ld", (long)hr.statusCode]);
+        ahaLog(@"w", [NSString stringWithFormat:@"直调失败 HTTP %ld", (long)hr.statusCode]);
     } else if (e) {
-      ahaLog(@"w", [NSString stringWithFormat:@"Direct PDP 网络错误：%@", e.localizedDescription]);
+      ahaLog(@"w", [NSString stringWithFormat:@"直调网络错误：%@", e.localizedDescription]);
     }
     dispatch_semaphore_signal(sem);
   }] resume];
@@ -1624,17 +1621,16 @@ static void ahaLog(NSString *lv, NSString *msg) {
                    && ![codeTxt isEqualToString:@"ERROR"]) ok = YES;
         }
         if (ok) {
-          // v0.5.28 合并成一行 + 带回包原文（对账聚星完成数用：93 vs 79 差异取证）
           [self markOk:taskId via:@"聚星直传" resp:rawHead];
         } else {
-          ahaLog(@"w", [NSString stringWithFormat:@"#%@ 聚星直传失败(code=%@ msg=%@ raw=%@)，转中枢代交",
-                 taskId, codeTxt, msgTxt, rawHead]);
+          // v0.5.30 精简：失败一行，带聚星原因（长原文只留在中枢 audit）
+          NSString *why = msgTxt.length ? msgTxt : (codeTxt.length ? codeTxt : @"无回包");
+          ahaLog(@"w", [NSString stringWithFormat:@"提交失败：%@", why]);
           [self hubSubmit:taskId taskUrl:taskUrl result:result];
         }
       });
     }] resume];
   } else {
-    ahaLog(@"i", [NSString stringWithFormat:@"#%@ 任务无聚星直传参数，走中枢代交", taskId]);
     [self hubSubmit:taskId taskUrl:taskUrl result:result];
   }
 }
@@ -1647,7 +1643,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
     dispatch_async(self.q, ^{
       if (j && [j[@"ok"] boolValue]) [self markOk:taskId via:@"中枢代交" resp:@""];
       else {
-        ahaLog(@"e", [NSString stringWithFormat:@"上传失败：%@（任务回池）",
+        ahaLog(@"e", [NSString stringWithFormat:@"提交失败：%@",
             j[@"error"] ?: (e.localizedDescription ?: @"未知")]);
         self.taskLine = @"";
         ahaRefreshUI();
@@ -1663,9 +1659,8 @@ static void ahaLog(NSString *lv, NSString *msg) {
 - (void)markOk:(NSString *)taskId via:(NSString *)via resp:(NSString *)resp {
   self.ok++;
   self.taskLine = @"";
-  // v0.5.28 Ajie 风格：成单一行 + 直传时带聚星回包原文（截 80 字，对账用）
-  ahaLog(@"s", [NSString stringWithFormat:@"成 %ld｜%@ 已交（%@）%@", (long)self.ok, taskId, via,
-         resp.length ? [NSString stringWithFormat:@" 回包:%@", resp] : @""]);
+  (void)taskId; (void)via; (void)resp;   // v0.5.30 精简：成功只留一行计数，回包原文不再进面板
+  ahaLog(@"s", [NSString stringWithFormat:@"提交成功 %ld", (long)self.ok]);
   ahaRefreshUI();
   // 聚星直传成功必须回执中枢记账（status=ok → 任务置 done + submitted+1）；
   // 中枢代交路径由 /api/pool/submit 自己记账，互斥不重复计
@@ -1718,7 +1713,8 @@ static void ahaTap(UIControl *c, void (^blk)(void)) {
 @property(nonatomic, strong) UIView *restRow;
 @property(nonatomic, strong) UISwitch *restOnSwitch;
 @property(nonatomic, strong) UILabel *restOnLabel;
-@property(nonatomic, strong) UITextView *logView;
+@property(nonatomic, strong) UIView *logBox;
+@property(nonatomic, strong) UILabel *logLabel;
 @property(nonatomic, strong) UIButton *gearBtn, *miniBtn, *startBtn, *resetBtn, *restBtn;
 - (void)boot;
 - (void)layoutPanel;
@@ -1874,16 +1870,19 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   [p addSubview:self.startBtn];
   [p addSubview:self.resetBtn];
 
-  // 日志窗
-  self.logView = [[UITextView alloc] initWithFrame:CGRectZero];
-  self.logView.editable = NO;
-  self.logView.selectable = NO;
-  self.logView.backgroundColor = AhaColor(0, 0, 0, 0.35);
-  self.logView.textColor = AhaColor(235, 235, 235, 0.92);
-  self.logView.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
-  self.logView.layer.cornerRadius = 8;
-  self.logView.clipsToBounds = YES;
-  [p addSubview:self.logView];
+  // 日志窗（v0.5.30：弃用 UITextView 滚动——高频重写+折行会让 contentOffset 滚出内容区变白屏；
+  // 改底部锚定 UILabel：内容永远从底部往上排，超高就裁掉最旧的，物理上不可能出现空白）
+  self.logBox = [[UIView alloc] initWithFrame:CGRectZero];
+  self.logBox.backgroundColor = AhaColor(0, 0, 0, 0.35);
+  self.logBox.layer.cornerRadius = 8;
+  self.logBox.clipsToBounds = YES;
+  [p addSubview:self.logBox];
+  self.logLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+  self.logLabel.numberOfLines = 0;
+  self.logLabel.backgroundColor = [UIColor clearColor];
+  self.logLabel.textColor = AhaColor(235, 235, 235, 0.92);
+  self.logLabel.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+  [self.logBox addSubview:self.logLabel];
 
   // 右下角 resize 手柄
   self.rh = [[UILabel alloc] initWithFrame:CGRectMake(w - 20, h - 20, 20, 20)];
@@ -2077,7 +2076,7 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   self.startBtn.frame = CGRectMake(12, y, w - 12 * 2 - 52 - 8, 46);
   self.resetBtn.frame = CGRectMake(w - 12 - 52, y, 52, 46);
   y += 54;
-  self.logView.frame  = CGRectMake(12, y, w - 24, h - y - 14);
+  self.logBox.frame   = CGRectMake(12, y, w - 24, h - y - 14);
   self.rh.frame       = CGRectMake(w - 20, h - 20, 20, 20);
 }
 
@@ -2098,15 +2097,16 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
     self.startBtn.backgroundColor = AhaColor(34, 170, 90, 1);
   }
   self.miniInfo.text = [NSString stringWithFormat:@"成 %ld", (long)gPool.ok];
-  // v0.5.28 日志窗渲染加固：每次都写文本 + 布局后滚底（修「日志消失」：旧版只在
-  // 行数>0 且内容变化时才写，长文本+高频刷新下 UITextView 偶发滚出空白区不回来）
+  // v0.5.30 日志渲染：底部锚定 UILabel（不滚动、不设 contentOffset，修「日志消失」）
   NSArray *lines = gPool.logLines;
   NSString *txt = [lines componentsJoinedByString:@"\n"];
-  self.logView.text = txt;
-  dispatch_async(dispatch_get_main_queue(), ^{
-    [self.logView layoutIfNeeded];
-    [self.logView scrollRangeToVisible:NSMakeRange(self.logView.text.length, 0)];
-  });
+  if (![txt isEqualToString:self.logLabel.text]) self.logLabel.text = txt;
+  CGFloat bw = self.logBox.bounds.size.width, bh = self.logBox.bounds.size.height;
+  if (bw > 1 && bh > 1) {
+    CGSize s = [self.logLabel sizeThatFits:CGSizeMake(bw - 8, CGFLOAT_MAX)];
+    // 底边固定贴着日志框底部：内容多就向上溢出、被 logBox 裁掉最旧的行（永远看得到最新状态）
+    self.logLabel.frame = CGRectMake(4, bh - s.height - 4, bw - 8, s.height);
+  }
 }
 
 @end
