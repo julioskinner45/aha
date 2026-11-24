@@ -618,19 +618,27 @@ static BOOL ahaTryRouteInvokes(NSArray *routes) {
   SEL navSel  = NSSelectorFromString(@"navigateFromViewController:destinationPath:navigateOption:completion:");
   SEL pushSel = NSSelectorFromString(@"pushFromViewController:destinationPath:pushOption:completion:");
 
+  NSUInteger idx = 0;
   for (NSString *route in routes) {
     ahaStep(@"导航:造路径对象");
     id path = nil;
     @try { path = ahaBuildPath(route); } @catch (__unused NSException *e) { path = nil; }
-    if (!path) continue;
+    if (!path) { idx++; continue; }
     if ([nav respondsToSelector:navSel]) {
       ahaStep(@"导航:navigate 调用");
-      if (ahaInvoke(nav, navSel, @[vc, path, [NSNull null], [NSNull null]], @"navigate")) return YES;
+      if (ahaInvoke(nav, navSel, @[vc, path, [NSNull null], [NSNull null]], @"navigate")) {
+        ahaLog(@"i", [NSString stringWithFormat:@"route#%lu 命中: %@", (unsigned long)idx, route]);
+        return YES;
+      }
     }
     if ([nav respondsToSelector:pushSel]) {
       ahaStep(@"导航:push 调用");
-      if (ahaInvoke(nav, pushSel, @[vc, path, [NSNull null], [NSNull null]], @"push")) return YES;
+      if (ahaInvoke(nav, pushSel, @[vc, path, [NSNull null], [NSNull null]], @"push")) {
+        ahaLog(@"i", [NSString stringWithFormat:@"route#%lu 命中(push): %@", (unsigned long)idx, route]);
+        return YES;
+      }
     }
+    idx++;
   }
   return NO;
 }
@@ -1469,7 +1477,13 @@ static void ahaLog(NSString *lv, NSString *msg) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{
       UIViewController *before = ahaResolvedTopVC();
+      // v0.5.25 = Ajie openCurrentTask 0x2f7fc+navigateWithBTManagerToRoute 0x23fb0 逐指令对齐：
+      // Ajie 主入口传入的 route 是 'rn/PRODUCT_PAGE?itemid=%@&shopid=%@'（无下划线），
+      // navigateWith 把它排在数组第 0 位，后面才是 item_id/good_id/shopid/PRODUCT_PAGE 四个备胎。
+      // 我们此前从没发过第 0 位的无下划线格式——若解析器只认 itemid/shopid，
+      // 我们打开的就是无商品参数的空壳 RN 页（页开了、数据死，症状完全吻合）
       NSArray *routes = @[
+        [NSString stringWithFormat:@"rn/PRODUCT_PAGE?itemid=%@&shopid=%@", itemId, shopId],   // ← Ajie 主格式
         [NSString stringWithFormat:@"rn/PRODUCT_PAGE?item_id=%@&shop_id=%@", itemId, shopId],
         [NSString stringWithFormat:@"rn/PRODUCT_PAGE?good_id=%@&shop_id=%@", itemId, shopId],
         [NSString stringWithFormat:@"rn/PRODUCT_PAGE?shopid=%@&itemid=%@", shopId, itemId],
