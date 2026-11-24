@@ -777,7 +777,7 @@ static NSMutableDictionary *gOrigDoneDict = nil;   // 类名 → orig(didComplet
 static NSMutableDictionary *gTaskBuf = nil;        // 兜底累积表：task 指针串 → 字节
 static NSString *const kAhaBufKey = @"aha_buf_v1"; // piggyback 键
 
-static IMP ahaOrigFor(NSMutableDictionary *dict, id obj) {
+__attribute__((unused)) static IMP ahaOrigFor(NSMutableDictionary *dict, id obj) {
   if (!dict || !obj) return NULL;
   Class cls = object_getClass(obj);
   if (!cls) return NULL;
@@ -796,46 +796,24 @@ static void ahaSwizzleDelegate(id delegate) {
   @try {
     Class cls = object_getClass(delegate);
     if (!cls) return;
-    if (!gOrigDataDict) gOrigDataDict = [NSMutableDictionary dictionary];
-    if (!gOrigDoneDict) gOrigDoneDict = [NSMutableDictionary dictionary];
-    if (!gTaskBuf)      gTaskBuf      = [NSMutableDictionary dictionary];
     NSString *cn = NSStringFromClass(cls);
     if (cn.length == 0) return;
-    BOOL already = NO;
-    @synchronized (gOrigDataDict) { already = (gOrigDataDict[cn] != nil); }
-    @synchronized (gOrigDoneDict) { already = already || (gOrigDoneDict[cn] != nil); }
-    if (already) return;
-
-    // Ajie 同款：优先虾皮自家回调（sel_registerName），不响应才回退 URLSession 系
-    SEL selShpData = sel_registerName("shpNetworkingModule:shpRequest:didReceiveData:");
-    SEL selShpDone = sel_registerName("shpNetworkingModule:shpRequest:didCompleteWithError:");
-    BOOL shpWay = [delegate respondsToSelector:selShpData];
-    SEL selData = shpWay ? selShpData : NSSelectorFromString(@"URLSession:dataTask:didReceiveData:");
-    SEL selDone = [delegate respondsToSelector:selShpDone] ? selShpDone
-                  : NSSelectorFromString(@"URLSession:task:didCompleteWithError:");
-
-    IMP origData = NULL, origDone = NULL;
-    if ([delegate respondsToSelector:selData]) {
-      MSHookMessageEx(cls, selData, (IMP)ahaDelegateDidReceiveData, &origData);
-      if (origData) @synchronized (gOrigDataDict) { gOrigDataDict[cn] = [NSValue valueWithPointer:origData]; }
-    }
-    if ([delegate respondsToSelector:selDone]) {
-      MSHookMessageEx(cls, selDone, (IMP)ahaDelegateDidComplete, &origDone);
-      if (origDone) @synchronized (gOrigDoneDict) { gOrigDoneDict[cn] = [NSValue valueWithPointer:origDone]; }
-    }
-    // v0.5.20：所有会话 delegate 都登记（上限 20）——
-    // v0.5.18 实测 6 条上限全是第三方 SDK（Firebase/AppsFlyer/Alamofire），
-    // 虾皮自家主会话的 delegate 被截掉看不见，无法裁决回包黑洞在哪层
+    // v0.5.21 = 关键实验：delegate MSHook 全停（只登记不挂钩）——
+    // v0.5.20 实测 app 全网 -1001/-1005 超时发生在采集开始前（启动即死），
+    // 同进程我们自建会话却秒回，唯一差异是我们挂钩了 ~15 个 delegate 类
+    // （多组件共享父类实现时 MSHook 变异父类 IMP，把回调链弄死的嫌疑最大）。
+    // PDP 采集不依赖 delegate 钩：NSJSONSerialization 兜底已实证能抓到回包（10:39:14 形状命中）
     static NSInteger sSwizzleLog = 0;
-    NSString *way = shpWay ? @"shp自家回调" : @"URLSession回调";
+    SEL selShpData = sel_registerName("shpNetworkingModule:shpRequest:didReceiveData:");
+    NSString *way = [delegate respondsToSelector:selShpData] ? @"shp自家回调" : @"URLSession回调";
     if (sSwizzleLog < 20) {
       sSwizzleLog++;
-      ahaLog(@"i", [NSString stringWithFormat:@"会话 delegate=%@ 钩%@", cn, way]);
+      ahaLog(@"i", [NSString stringWithFormat:@"会话 delegate=%@ %@（未挂钩·被动观察）", cn, way]);
     }
   } @catch (__unused NSException *e) { /* 静默 */ }
 }
 
-static void ahaDelegateDidReceiveData(id self, SEL _cmd, id module, id requestLike, NSData *data) {
+__attribute__((unused)) static void ahaDelegateDidReceiveData(id self, SEL _cmd, id module, id requestLike, NSData *data) {
   ahaObserveRecv();   // v0.5.19：回包事件计数（delegate 通道）
   IMP orig = ahaOrigFor(gOrigDataDict, self);
   if (orig)
@@ -902,7 +880,7 @@ static void ahaDelegateDidReceiveData(id self, SEL _cmd, id module, id requestLi
   } @catch (__unused NSException *e) { /* 静默 */ }
 }
 
-static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike, NSError *error) {
+__attribute__((unused)) static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike, NSError *error) {
   IMP orig = ahaOrigFor(gOrigDoneDict, self);
   if (orig)
     ((void (*)(id, SEL, id, id, NSError *))orig)(self, _cmd, module, requestLike, error); // Ajie 同序
