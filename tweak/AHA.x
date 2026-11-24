@@ -315,12 +315,9 @@ static BOOL ahaPdpBodyValid(NSString *body) {
   return have >= 8;
 }
 
-// 真商品回包但字段不全 → 上限 3 条日志（防刷屏），丢弃不入库
+// 真商品回包但字段不全 → 静默丢弃不入库（v0.5.37 用户令：不动手就不该有日志，门照常工作）
 static void ahaBadBodyLog(NSString *body, NSString *shop, NSString *item) {
-  static NSInteger sBad = 0;
-  if (sBad >= 3) return;
-  sBad++;
-  ahaLog(@"w", [NSString stringWithFormat:@"PDP回包字段不全，丢弃（%@/%@）", shop, item]);
+  return;
 }
 
 - (NSDictionary *)contextCopy {
@@ -935,18 +932,8 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
     ((void (*)(id, SEL, id, id, NSError *))orig)(self, _cmd, module, requestLike, error); // Ajie 同序
   @try {
     if (error) {
-      // v0.5.18：任何 delegate 任务的失败都记（前 5 条封顶）——
-      // 页面「載入失敗」必有对应错误在这里浮出，除非请求根本没经过我们钩住的通道
-      static NSInteger sErrLog = 0;
-      if (sErrLog < 5) {
-        sErrLog++;
-        NSString *u = @"";
-        if ([requestLike isKindOfClass:[NSURLSessionTask class]])
-          u = ((NSURLSessionTask *)requestLike).currentRequest.URL.absoluteString ?: @"";
-        if (u.length > 90) u = [[u substringToIndex:90] stringByAppendingString:@"…"];
-        ahaLog(@"w", [NSString stringWithFormat:@"delegate回包错误(%ld): %@ %@",
-               (long)error.code, error.localizedDescription ?: @"", u]);
-      }
+      // v0.5.37：静默——视频 CDN 取消(-999)/网络抖动这类错误与采集无关，刷屏全是噪音；
+      // 失败的回包本来也过不了十字段门，不需要日志提示
       return;
     }
     if (!gPool) return;
@@ -1638,7 +1625,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
   dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(22 * NSEC_PER_SEC)));
   if (out.length > 100) {
     if (ahaPdpBodyValid(out)) [[AHACapture shared] storeBody:out shop:shopId item:itemId];
-    else { ahaLog(@"w", @"直调回包字段不全，不提交"); out = nil; }   // v0.5.31 十字段门
+    else { out = nil; }   /* v0.5.31 十字段门；v0.5.37 静默不刷日志 */
   } else out = nil;
   return out;
 }
