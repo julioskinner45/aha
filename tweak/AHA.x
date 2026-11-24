@@ -729,26 +729,11 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
   }
   return %orig;
 }
-// v0.5.19：delegate 式会话（无 completionHandler）的发送此前完全隐形——只观察不包裹
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
-  NSString *u = request.URL.absoluteString ?: @"";
-  ahaObserveURL([@"D:" stringByAppendingString:u]);   // v0.5.20：D=delegate 式通道
-  if (u.length && [u rangeOfString:kPdpMark].location != NSNotFound) {
-    static NSInteger sSessLog3 = 0;
-    if (sSessLog3 < 3) {
-      sSessLog3++;
-      ahaLog(@"i", [NSString stringWithFormat:@"PDP请求(D通道) 经会话 delegate=%@",
-             ahaSessDelegateCls((NSURLSession *)self)]);
-    }
-  }
-  return %orig;
-}
-- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)URL {
-  ahaObserveURL([@"D:" stringByAppendingString:URL.absoluteString ?: @""]);
-  return %orig;
-}
 %end
 %end // gNetCapture
+// v0.5.23：删掉两个无 completionHandler 观察钩（dataTaskWithRequest:/dataTaskWithURL:）——
+// Ajie 反汇编实证装钩面只有 3 个钩（0x1423c/0x1425c/0x14290），我们多钩的这两个是
+// 唯一的钩子面差异，一并削除，钩子面与 Ajie 完全等价
 
 %group gNetJSON
 // —— Ajie 1:1 第三钩：NSJSONSerialization（万能兜底）——
@@ -784,7 +769,7 @@ static NSMutableDictionary *gOrigDoneDict = nil;   // 类名 → orig(didComplet
 static NSMutableDictionary *gTaskBuf = nil;        // 兜底累积表：task 指针串 → 字节
 static NSString *const kAhaBufKey = @"aha_buf_v1"; // piggyback 键
 
-__attribute__((unused)) static IMP ahaOrigFor(NSMutableDictionary *dict, id obj) {
+static IMP ahaOrigFor(NSMutableDictionary *dict, id obj) {
   if (!dict || !obj) return NULL;
   Class cls = object_getClass(obj);
   if (!cls) return NULL;
@@ -803,24 +788,47 @@ static void ahaSwizzleDelegate(id delegate) {
   @try {
     Class cls = object_getClass(delegate);
     if (!cls) return;
+    if (!gOrigDataDict) gOrigDataDict = [NSMutableDictionary dictionary];
+    if (!gOrigDoneDict) gOrigDoneDict = [NSMutableDictionary dictionary];
+    if (!gTaskBuf)      gTaskBuf      = [NSMutableDictionary dictionary];
     NSString *cn = NSStringFromClass(cls);
     if (cn.length == 0) return;
-    // v0.5.21 = 关键实验：delegate MSHook 全停（只登记不挂钩）——
-    // v0.5.20 实测 app 全网 -1001/-1005 超时发生在采集开始前（启动即死），
-    // 同进程我们自建会话却秒回，唯一差异是我们挂钩了 ~15 个 delegate 类
-    // （多组件共享父类实现时 MSHook 变异父类 IMP，把回调链弄死的嫌疑最大）。
-    // PDP 采集不依赖 delegate 钩：NSJSONSerialization 兜底已实证能抓到回包（10:39:14 形状命中）
-    static NSInteger sSwizzleLog = 0;
+    BOOL already = NO;
+    @synchronized (gOrigDataDict) { already = (gOrigDataDict[cn] != nil); }
+    @synchronized (gOrigDoneDict) { already = already || (gOrigDoneDict[cn] != nil); }
+    if (already) return;
+
+    // v0.5.23 恢复挂钩（v0.5.21 曾全停）：Ajie 同款做法实证无罪——
+    // Ajie 也对 delegate 类做 MSHookMessageEx（shp 回调优先）且同引擎同类名，照样活着。
+    // delegate 钩是 Ajie 的主采集通道（shp 自家回调），恢复=与 Ajie 完全等价
     SEL selShpData = sel_registerName("shpNetworkingModule:shpRequest:didReceiveData:");
-    NSString *way = [delegate respondsToSelector:selShpData] ? @"shp自家回调" : @"URLSession回调";
+    SEL selShpDone = sel_registerName("shpNetworkingModule:shpRequest:didCompleteWithError:");
+    BOOL shpWay = [delegate respondsToSelector:selShpData];
+    SEL selData = shpWay ? selShpData : NSSelectorFromString(@"URLSession:dataTask:didReceiveData:");
+    SEL selDone = [delegate respondsToSelector:selShpDone] ? selShpDone
+                  : NSSelectorFromString(@"URLSession:task:didCompleteWithError:");
+
+    IMP origData = NULL, origDone = NULL;
+    if ([delegate respondsToSelector:selData]) {
+      MSHookMessageEx(cls, selData, (IMP)ahaDelegateDidReceiveData, &origData);
+      if (origData) @synchronized (gOrigDataDict) { gOrigDataDict[cn] = [NSValue valueWithPointer:origData]; }
+    }
+    if ([delegate respondsToSelector:selDone]) {
+      MSHookMessageEx(cls, selDone, (IMP)ahaDelegateDidComplete, &origDone);
+      if (origDone) @synchronized (gOrigDoneDict) { gOrigDoneDict[cn] = [NSValue valueWithPointer:origDone]; }
+    }
+
+    // 登记日志（上限 20，防第三方 SDK 刷屏）
+    static NSInteger sSwizzleLog = 0;
+    NSString *way = shpWay ? @"shp自家回调" : @"URLSession回调";
     if (sSwizzleLog < 20) {
       sSwizzleLog++;
-      ahaLog(@"i", [NSString stringWithFormat:@"会话 delegate=%@ %@（未挂钩·被动观察）", cn, way]);
+      ahaLog(@"i", [NSString stringWithFormat:@"会话 delegate=%@ 钩%@", cn, way]);
     }
   } @catch (__unused NSException *e) { /* 静默 */ }
 }
 
-__attribute__((unused)) static void ahaDelegateDidReceiveData(id self, SEL _cmd, id module, id requestLike, NSData *data) {
+static void ahaDelegateDidReceiveData(id self, SEL _cmd, id module, id requestLike, NSData *data) {
   ahaObserveRecv();   // v0.5.19：回包事件计数（delegate 通道）
   IMP orig = ahaOrigFor(gOrigDataDict, self);
   if (orig)
@@ -887,7 +895,7 @@ __attribute__((unused)) static void ahaDelegateDidReceiveData(id self, SEL _cmd,
   } @catch (__unused NSException *e) { /* 静默 */ }
 }
 
-__attribute__((unused)) static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike, NSError *error) {
+static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike, NSError *error) {
   IMP orig = ahaOrigFor(gOrigDoneDict, self);
   if (orig)
     ((void (*)(id, SEL, id, id, NSError *))orig)(self, _cmd, module, requestLike, error); // Ajie 同序
@@ -2183,7 +2191,7 @@ static void ahaSignalHandler(int sig) {
   raise(sig);
 }
 
-static void ahaInstallCrashCatcher(void) {
+__attribute__((unused)) static void ahaInstallCrashCatcher(void) {
   NSString *p = [NSString stringWithFormat:@"%@/aha_crash.log", NSHomeDirectory()];
   strncpy(gAhaSigPath, p.fileSystemRepresentation, sizeof(gAhaSigPath) - 1);
   NSSetUncaughtExceptionHandler(&ahaUncaughtHandler);
@@ -2225,21 +2233,15 @@ static void ahaReportLastCrash(void) {
 }
 
 %ctor {
-  // v0.5.22 纯净模式开关：默认纯净（无网络钩子+无崩溃捕获器），设置里可切完整模式。
-  // 诊断逻辑：纯净模式下虾皮网络若恢复 → 凶手在网络钩子组；若仍死 → 在 UI/框架本身
+  // v0.5.23：默认完整模式——钩子面已削成与 Ajie 完全等价（3 钩 + delegate 挂钩），
+  // 崩溃捕获器不再装（Ajie 符号表实证：无 signal/sigaction/UncaughtExceptionHandler）。
+  // 纯净模式开关保留（aha_pure_v1），留作以后二分用
   id pv = [[NSUserDefaults standardUserDefaults] objectForKey:@"aha_pure_v1"];
-  gPure = pv ? [pv boolValue] : YES;
+  gPure = pv ? [pv boolValue] : NO;
   if (!gPure) {
-    ahaInstallCrashCatcher();  // 最先装，任何闪退都要留下证据
-    %init(gNetCapture);        // 三个网络钩子组（completionHandler/JSON/会话 delegate 登记）
-    %init(gNetJSON);
-    %init(gNetSession);
-    // 6 秒后重装崩溃 handler：Shopee app 启动时会装自己的崩溃处理器把我们覆盖掉
-    //（v0.5.5 崩了没日志的根因），覆盖回去才能持续抓到段错误证据
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
-        dispatch_get_main_queue(), ^{
-      ahaInstallCrashCatcher();
-    });
+    %init(gNetCapture);        // completionHandler 双变体（Ajie 0x1423c/0x1425c 1:1）
+    %init(gNetJSON);           // NSJSONSerialization 元类钩（Ajie 0x14290 1:1）
+    %init(gNetSession);        // sessionWithConfiguration 元类钩 → delegate 挂钩（Ajie 0x41d7c 同款）
   }
   gPool = [AHAPool shared];
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
