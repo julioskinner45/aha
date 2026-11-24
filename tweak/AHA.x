@@ -64,6 +64,7 @@ static NSString *const kGetPcTpl  = @"https://shopee.tw/api/v4/pdp/get_pc?displa
 @class AHAUI;
 
 static AHAPool *gPool = nil;
+static BOOL gPanelDragging = NO;   // v0.5.39 面板拖拽中：期间跳过日志重排版（sizeThatFits 叠在手指帧上会卡手）
 static AHAUI   *gUI   = nil;
 // v0.5.22 纯净模式开关（aha_pure_v1，默认开）：二分定位「装上即全网死」——
 // 纯净 = 不装任何网络钩子 + 不装崩溃捕获器；完整 = 功能全装。切换后需重启虾皮生效
@@ -2225,14 +2226,19 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   }
   self.miniInfo.text = [NSString stringWithFormat:@"成 %ld", (long)gPool.ok];
   // v0.5.30 日志渲染：底部锚定 UILabel（不滚动、不设 contentOffset，修「日志消失」）
+  // v0.5.39 丝滑：文本/框尺寸没变不重排版；拖拽中整个跳过（长日志 sizeThatFits 每 250ms
+  // 白算一遍，正好叠在手指移动帧上 = 拖起来卡手），松手后下一轮自动补上
   NSArray *lines = gPool.logLines;
   NSString *txt = [lines componentsJoinedByString:@"\n"];
-  if (![txt isEqualToString:self.logLabel.text]) self.logLabel.text = txt;
   CGFloat bw = self.logBox.bounds.size.width, bh = self.logBox.bounds.size.height;
-  if (bw > 1 && bh > 1) {
+  static NSString *sLastTxt; static CGFloat sLastBW = 0, sLastBH = 0;
+  if (!gPanelDragging && bw > 1 && bh > 1
+      && (![txt isEqualToString:sLastTxt] || bw != sLastBW || bh != sLastBH)) {
+    if (![txt isEqualToString:self.logLabel.text]) self.logLabel.text = txt;
     CGSize s = [self.logLabel sizeThatFits:CGSizeMake(bw - 8, CGFLOAT_MAX)];
     // 底边固定贴着日志框底部：内容多就向上溢出、被 logBox 裁掉最旧的行（永远看得到最新状态）
     self.logLabel.frame = CGRectMake(4, bh - s.height - 4, bw - 8, s.height);
+    sLastTxt = txt; sLastBW = bw; sLastBH = bh;
   }
 }
 
@@ -2258,15 +2264,19 @@ static void ahaRefreshUI(void) {
 @implementation AHAPanel
 - (void)ahaPan:(UIPanGestureRecognizer *)g {
   static CGPoint origin;
-  if (g.state == UIGestureRecognizerStateBegan) origin = self.center;
+  if (g.state == UIGestureRecognizerStateBegan) { origin = self.center; gPanelDragging = YES; }
   if (g.state == UIGestureRecognizerStateChanged) {
     CGPoint t = [g translationInView:self];
     self.center = CGPointMake(origin.x + t.x, origin.y + t.y);
   }
-  if (g.state == UIGestureRecognizerStateEnded && gPool) {
-    gPool.cfg[@"panelX"] = @(self.frame.origin.x);
-    gPool.cfg[@"panelY"] = @(self.frame.origin.y);
-    [gPool saveCfg];
+  if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled) {
+    gPanelDragging = NO;
+    if (gPool) {
+      gPool.cfg[@"panelX"] = @(self.frame.origin.x);
+      gPool.cfg[@"panelY"] = @(self.frame.origin.y);
+      [gPool saveCfg];
+      ahaRefreshUI();   // 松手后立即补一次日志排版，不等 250ms 合并窗
+    }
   }
 }
 - (void)ahaResize:(UIPanGestureRecognizer *)g {
