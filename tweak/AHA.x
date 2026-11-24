@@ -72,11 +72,17 @@ static void ahaLog(NSString *lv, NSString *msg);          // 写日志 + 面板�
 // 说明 get_pc 路径假设是错的或者请求根本没发；有端点但没抓到=匹配规则错
 static NSDate *gObserveUntil = nil;
 static NSInteger gObsCount = 0;
+static NSInteger gObsAny = 0;      // v0.5.18：窗口内全部请求（不限域名）
+static NSInteger gObsShopee = 0;   // 窗口内虾皮域名请求
+static NSInteger gObsJSON = 0;     // 窗口内 NSJSON 解析次数
 static NSMutableArray *gObsURLs = nil;
 static BOOL gObsFlushed = NO;
 static void ahaObserveFlush(void) {
-  if (gObsFlushed || !gObsURLs.count) { gObsFlushed = YES; return; }
+  if (gObsFlushed) return;
   gObsFlushed = YES;
+  // v0.5.18：哪怕全 0 也打印摘要行——0 本身就是裁决性证据
+  ahaLog(@"i", [NSString stringWithFormat:@"观察窗: 请求%ld条(虾皮%ld) JSON解析%ld次",
+         (long)gObsAny, (long)gObsShopee, (long)gObsJSON]);
   NSUInteger n = gObsURLs.count;
   for (NSUInteger i = 0; i < n; i += 4) {
     NSRange r = NSMakeRange(i, MIN((NSUInteger)4, n - i));
@@ -87,7 +93,7 @@ static void ahaObserveFlush(void) {
 }
 static void ahaObserveBegin(void) {
   gObserveUntil = [NSDate dateWithTimeIntervalSinceNow:30];
-  gObsCount = 0; gObsFlushed = NO;
+  gObsCount = 0; gObsAny = 0; gObsShopee = 0; gObsJSON = 0; gObsFlushed = NO;
   if (!gObsURLs) gObsURLs = [NSMutableArray array]; else [gObsURLs removeAllObjects];
 }
 static void ahaObserveURL(NSString *u) {
@@ -95,11 +101,13 @@ static void ahaObserveURL(NSString *u) {
     if (!gObsFlushed) ahaObserveFlush();          // 窗口自然到期 → 惰性刷出
     return;
   }
+  if (u.length) gObsAny++;                        // v0.5.18：全域名计数
   if (gObsCount >= 60) return;
   if (!u || u.length == 0) return;
   NSURL *uu = [NSURL URLWithString:u];
   NSString *host = uu.host ?: @"";
-  if (![host containsString:@"shopee"]) return;                 // 只看虾皮域
+  if (![host containsString:@"shopee"]) return;
+  gObsShopee++;
   gObsCount++;
   NSString *path = [NSString stringWithFormat:@"%@%@", host, uu.path ?: @""];
   NSString *q = uu.query ?: @"";
@@ -268,6 +276,19 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
 - (void)inspectJSON:(NSDictionary *)obj {
   if (!gPool || ![obj isKindOfClass:[NSDictionary class]]) return;
   @try {
+    // v0.5.18 近似命中诊断：窗口内解析到 API 型回包（带 error 键）但形状不符 → 记录顶层键
+    if (gObserveUntil && [gObserveUntil compare:[NSDate date]] == NSOrderedAscending &&
+        obj[@"error"] != nil) {
+      static NSInteger sNearMiss = 0;
+      if (sNearMiss < 2) {
+        sNearMiss++;
+        NSString *keys = [[[obj allKeys] sortedArrayUsingSelector:@selector(compare:)]
+                          componentsJoinedByString:@","];
+        if (keys.length > 120) keys = [[keys substringToIndex:120] stringByAppendingString:@"…"];
+        ahaLog(@"i", [NSString stringWithFormat:@"JSON形状: error=%@ keys=[%@]",
+               obj[@"error"], keys]);
+      }
+    }
     id data = obj[@"data"];
     if (![data isKindOfClass:[NSDictionary class]]) return;
     id item = data[@"item"];
@@ -688,6 +709,7 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
 %hook NSJSONSerialization
 + (id)JSONObjectWithData:(NSData *)data options:(NSUInteger)opts error:(NSError **)error {
   id obj = %orig;
+  if (gObserveUntil && [gObserveUntil compare:[NSDate date]] == NSOrderedAscending) gObsJSON++; // v0.5.18
   if ([obj isKindOfClass:[NSDictionary class]]) {
     @try { [[AHACapture shared] inspectJSON:obj]; } @catch (__unused NSException *e) { /* 非目标 */ }
   }
@@ -759,10 +781,14 @@ static void ahaSwizzleDelegate(id delegate) {
       MSHookMessageEx(cls, selDone, (IMP)ahaDelegateDidComplete, &origDone);
       if (origDone) @synchronized (gOrigDoneDict) { gOrigDoneDict[cn] = [NSValue valueWithPointer:origDone]; }
     }
-    // 只对钩到虾皮自家回调的 delegate 打一条日志——第三方 SDK（Firebase/AppsFlyer 等
-    // 走 URLSession 回调的）全是废日志，用户反馈「没用的日志别出现」
-    if (shpWay)
-      ahaLog(@"i", [NSString stringWithFormat:@"已挂钩 %@（shp 自家回调）", cn]);
+    // v0.5.18：所有会话 delegate 都登记（前 6 条封顶，防刷屏）——
+    // 一条都没有 = 虾皮的会话在我们 %ctor 之前就建好了 = delegate 通道整体失明
+    static NSInteger sSwizzleLog = 0;
+    NSString *way = shpWay ? @"shp自家回调" : @"URLSession回调";
+    if (sSwizzleLog < 6) {
+      sSwizzleLog++;
+      ahaLog(@"i", [NSString stringWithFormat:@"会话 delegate=%@ 钩%@", cn, way]);
+    }
   } @catch (__unused NSException *e) { /* 静默 */ }
 }
 
@@ -838,12 +864,17 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
     ((void (*)(id, SEL, id, id, NSError *))orig)(self, _cmd, module, requestLike, error); // Ajie 同序
   @try {
     if (error) {
-      // v0.5.15 诊断：网络层失败不再静默（URLSession 路径能拿到 URL，只记 pdp 的）
-      if ([requestLike isKindOfClass:[NSURLSessionTask class]]) {
-        NSString *u = ((NSURLSessionTask *)requestLike).currentRequest.URL.absoluteString ?: @"";
-        if (u.length && [u rangeOfString:kPdpMark].location != NSNotFound)
-          ahaLog(@"w", [NSString stringWithFormat:@"get_pc 网络错误（delegate 通道）：%@ (%ld)",
-              error.localizedDescription ?: @"未知", (long)error.code]);
+      // v0.5.18：任何 delegate 任务的失败都记（前 5 条封顶）——
+      // 页面「載入失敗」必有对应错误在这里浮出，除非请求根本没经过我们钩住的通道
+      static NSInteger sErrLog = 0;
+      if (sErrLog < 5) {
+        sErrLog++;
+        NSString *u = @"";
+        if ([requestLike isKindOfClass:[NSURLSessionTask class]])
+          u = ((NSURLSessionTask *)requestLike).currentRequest.URL.absoluteString ?: @"";
+        if (u.length > 90) u = [[u substringToIndex:90] stringByAppendingString:@"…"];
+        ahaLog(@"w", [NSString stringWithFormat:@"delegate回包错误(%ld): %@ %@",
+               (long)error.code, error.localizedDescription ?: @"", u]);
       }
       return;
     }
