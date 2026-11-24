@@ -39,6 +39,7 @@
 // 全被动：不改任何请求/响应、不做检测绕过、不隐藏越狱。
 
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>   // v0.5.36 CABasicAnimation（风控横幅闪烁）
 #import <Foundation/Foundation.h>
 #import <objc/message.h>
 #import <signal.h>
@@ -1808,6 +1809,7 @@ static void ahaTap(UIControl *c, void (^blk)(void)) {
 @property(nonatomic, strong) UILabel *restOnLabel;
 @property(nonatomic, strong) UIView *logBox;
 @property(nonatomic, strong) UILabel *logLabel;
+@property(nonatomic, strong) UIView *riskBanner;   // v0.5.36 风控醒目横幅（Ajie 同款：红色闪烁条）
 @property(nonatomic, strong) UIButton *gearBtn, *miniBtn, *startBtn, *resetBtn, *restBtn;
 - (void)boot;
 - (void)layoutPanel;
@@ -1890,7 +1892,8 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   if (y < 0 || y + h > scr.size.height) y = scr.size.height * 0.10;
 
   AHAPanel *p = [[AHAPanel alloc] initWithFrame:CGRectMake(x, y, w, h)];
-  p.backgroundColor = AhaColor(16, 18, 24, 0.62);   // v0.5.28 半透明（用户指定，Ajie 同款质感）
+  /* v0.5.36 维持 0.62：白框=Shopee 自己的弹窗透底，Ajie 也一样，用户拍板「就那样吧」 */
+  p.backgroundColor = AhaColor(16, 18, 24, 0.62);   // v0.5.28 半透明（Ajie 同款质感）
   p.layer.cornerRadius = 14;
   p.clipsToBounds = YES;
   p.layer.borderWidth = 1;
@@ -1977,6 +1980,20 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   self.logLabel.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
   [self.logBox addSubview:self.logLabel];
 
+  // v0.5.36 风控横幅：header 正下方红条 + 闪烁，一进风控肉眼躲不开（Ajie 同款醒目度）
+  UIView *rb = [[UIView alloc] initWithFrame:CGRectMake(0, 40, w, 26)];
+  rb.backgroundColor = AhaColor(214, 40, 40, 0.96);
+  rb.clipsToBounds = YES;
+  UILabel *rl = [[UILabel alloc] initWithFrame:rb.bounds];
+  rl.textAlignment = NSTextAlignmentCenter;
+  rl.font = [UIFont boldSystemFontOfSize:13];
+  rl.textColor = [UIColor whiteColor];
+  rl.text = @"⚠ 风控！已自动停止，请手动过滑块/验证后再开始";
+  [rb addSubview:rl];
+  rb.hidden = YES;
+  [p addSubview:rb];
+  self.riskBanner = rb;
+
   // 右下角 resize 手柄
   self.rh = [[UILabel alloc] initWithFrame:CGRectMake(w - 20, h - 20, 20, 20)];
   self.rh.text = @"◢";
@@ -1986,15 +2003,15 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   [p addSubview:self.rh];
   [self.rh addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:p action:@selector(ahaResize:)]];
 
-  // 收起小球
-  UIView *mv = [[UIView alloc] initWithFrame:CGRectMake(scr.size.width - 78, scr.size.height * 0.16, 64, 30)];
+  // 收起小球（v0.5.36 加大：64x30→86x44，像 Ajie 一样一眼能看清「成 N」）
+  UIView *mv = [[UIView alloc] initWithFrame:CGRectMake(scr.size.width - 100, scr.size.height * 0.16, 86, 44)];
   mv.backgroundColor = AhaColor(28, 120, 240, 0.95);
-  mv.layer.cornerRadius = 15;
+  mv.layer.cornerRadius = 22;
   mv.hidden = YES;
   self.mini = mv;
   self.miniInfo = [[UILabel alloc] initWithFrame:mv.bounds];
   self.miniInfo.textAlignment = NSTextAlignmentCenter;
-  self.miniInfo.font = [UIFont boldSystemFontOfSize:12];
+  self.miniInfo.font = [UIFont boldSystemFontOfSize:16];
   self.miniInfo.textColor = [UIColor whiteColor];
   [mv addSubview:self.miniInfo];
   UITapGestureRecognizer *mvTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(miniTapped)];
@@ -2038,9 +2055,7 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
     [wp helloTick];
   }];
 
-  ahaLog(@"s", gPure
-      ? @"AHA 已注入（纯净模式：无网络钩子，设置⚙里可切完整模式）"
-      : @"AHA 已注入（完整模式：网络钩子已装）");
+  ahaLog(@"s", gPure ? @"AHA 已注入（纯净模式）" : @"AHA 已注入");   // v0.5.36：启动只报这一条（上次崩溃汇报已停用，面包屑仍记在本地，要查随时能翻）
 }
 
 - (void)fieldsChanged {
@@ -2128,7 +2143,7 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   self.mini.hidden = !mini;
   if (mini) {
     CGRect scr = [UIScreen mainScreen].bounds;
-    self.mini.frame = CGRectMake(scr.size.width - 78, MIN(MAX(self.panel.frame.origin.y + 20, 60), scr.size.height - 60), 64, 30);
+    self.mini.frame = CGRectMake(scr.size.width - 100, MIN(MAX(self.panel.frame.origin.y + 20, 60), scr.size.height - 70), 86, 44);
     self.miniInfo.text = [NSString stringWithFormat:@"成 %ld", (long)gPool.ok];
   }
 }
@@ -2150,6 +2165,7 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   self.gearBtn.frame = CGRectMake(w - 72, 4, 32, 32);
   self.miniBtn.frame = CGRectMake(w - 40, 4, 36, 32);
   self.statusLabel.frame  = CGRectMake(12, 48, w - 24, 20);
+  if (self.riskBanner) self.riskBanner.frame = CGRectMake(0, 40, w, 26);   // v0.5.36 跟随面板宽度
   self.counterLabel.frame = CGRectMake(12, 70, w - 24, 30);
   self.taskLabel.frame    = CGRectMake(12, 102, w - 24, 16);
   self.userField.frame = CGRectMake(12, 122, w - 24, 34);
@@ -2176,6 +2192,24 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
 - (void)refresh {
   if (!self.panel) return;
   self.statusLabel.text = gPool.statusText;
+  // v0.5.36 风控横幅：进风控显示+闪烁，解除即收（risk 在 beginRun/成功回包时清零）
+  BOOL rk = gPool.risk;
+  if (self.riskBanner && self.riskBanner.hidden == rk) {
+    self.riskBanner.hidden = !rk;
+    NSString *animKey = @"ahaRiskBlink";
+    if (rk) {
+      CABasicAnimation *blink = [CABasicAnimation animationWithKeyPath:@"opacity"];
+      blink.fromValue = @1.0;
+      blink.toValue = @0.35;
+      blink.duration = 0.55;
+      blink.autoreverses = YES;
+      blink.repeatCount = HUGE_VALF;
+      [self.riskBanner.layer removeAnimationForKey:animKey];
+      [self.riskBanner.layer addAnimation:blink forKey:animKey];
+    } else {
+      [self.riskBanner.layer removeAnimationForKey:animKey];
+    }
+  }
   self.statusLabel.textColor = gPool.risk ? AhaColor(255, 90, 80, 1)
       : (gPool.running ? AhaColor(80, 220, 120, 1)
       : (gPool.connected ? AhaColor(120, 200, 255, 1) : AhaColor(255, 255, 255, 0.4)));
@@ -2314,8 +2348,9 @@ __attribute__((unused)) static void ahaInstallCrashCatcher(void) {
   signal(SIGTRAP, &ahaSignalHandler);
 }
 
-// 启动时读出上次崩溃记录，写进面板日志
-static void ahaReportLastCrash(void) {
+// 启动时读出上次崩溃记录，写进面板日志（v0.5.36 停用：用户要求启动日志只显示「AHA 已注入」。
+// 函数保留备用；面包屑 ahaStep 与崩溃落盘照常写本地，要排查随时把这里的调用接回去）
+__attribute__((unused)) static void ahaReportLastCrash(void) {
   // 面包屑（最关键：闪退前最后执行的步骤，哪一步死了直接可见）
   NSString *step = [[NSUserDefaults standardUserDefaults] stringForKey:@"aha_step_v1"];
   if (step.length) {
@@ -2361,6 +2396,6 @@ static void ahaReportLastCrash(void) {
       dispatch_get_main_queue(), ^{
     gUI = [AHAUI shared];
     [gUI boot];
-    ahaReportLastCrash();    // 面板起来后第一时间汇报上次闪退根因
+    // v0.5.36：ahaReportLastCrash() 停用——启动日志只显示「AHA 已注入」
   });
 }
