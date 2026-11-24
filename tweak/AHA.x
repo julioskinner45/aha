@@ -80,8 +80,8 @@ static void ahaObserveFlush(void) {
   NSUInteger n = gObsURLs.count;
   for (NSUInteger i = 0; i < n; i += 4) {
     NSRange r = NSMakeRange(i, MIN((NSUInteger)4, n - i));
-    NSString *line = [gObsURLs subarrayWithRange:r].componentsJoinedByString:@" | "];
-    ahaLog(@"i", [NSString stringWithFormat:@"观察窗URL(%lu/%lu): %@", (unsigned long)i + r.length, (unsigned long)n, line]);
+    NSString *line = [[gObsURLs subarrayWithRange:r] componentsJoinedByString:@" | "];
+    ahaLog(@"i", [NSString stringWithFormat:@"观察窗URL(%lu/%lu): %@", (unsigned long)(i + r.length), (unsigned long)n, line]);
   }
   [gObsURLs removeAllObjects];
 }
@@ -856,7 +856,7 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
       SEL selRemove = NSSelectorFromString(@"removeObjectForKeyedSubscript:");
       for (NSString *k in @[@"responseData", @"data", @"rawData", @"bodyData", kAhaBufKey]) {
         id pig = [requestLike objectForKeyedSubscript:k];
-        if ([pig isKindOfClass:[NSData class]] && pig.length) {
+        if ([pig isKindOfClass:[NSData class]] && [(NSData *)pig length] > 0) {
           bufData = [NSData dataWithData:pig];
           if ([k isEqualToString:kAhaBufKey] && [requestLike respondsToSelector:selRemove])
             ((void (*)(id, SEL, id))objc_msgSend)(requestLike, selRemove, kAhaBufKey); // 取完即清，防重复投递
@@ -868,7 +868,7 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
       SEL selData = NSSelectorFromString(@"data");
       if (!isTask && [requestLike respondsToSelector:selData]) {
         id buf = ((id (*)(id, SEL))objc_msgSend)(requestLike, selData);
-        if ([buf isKindOfClass:[NSData class]] && buf.length) bufData = [NSData dataWithData:buf];
+        if ([buf isKindOfClass:[NSData class]] && [(NSData *)buf length] > 0) bufData = [NSData dataWithData:buf];
       }
     }
     if (!bufData && isTask) {
@@ -904,7 +904,7 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
           if ([rq respondsToSelector:selURL]) urlObj = ((id (*)(id, SEL))objc_msgSend)(rq, selURL);
         }
       }
-      if ([urlObj isKindOfClass:[NSURL class]]) u = urlObj.absoluteString ?: @"";
+      if ([urlObj isKindOfClass:[NSURL class]]) u = [(NSURL *)urlObj absoluteString] ?: @"";
     }
     // URL 已知且不是 pdp 端点 → 跳过；URL 未知（空串）→ inspectRawBody 只靠形状识别把关
     if (u.length && [u rangeOfString:kPdpMark].location == NSNotFound) return;
