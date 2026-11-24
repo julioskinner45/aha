@@ -1892,8 +1892,8 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   if (y < 0 || y + h > scr.size.height) y = scr.size.height * 0.10;
 
   AHAPanel *p = [[AHAPanel alloc] initWithFrame:CGRectMake(x, y, w, h)];
-  /* v0.5.36 维持 0.62：白框=Shopee 自己的弹窗透底，Ajie 也一样，用户拍板「就那样吧」 */
-  p.backgroundColor = AhaColor(16, 18, 24, 0.62);   // v0.5.28 半透明（Ajie 同款质感）
+  /* v0.5.36b 0.62→0.75：用户反馈「有点太透明，稍微深点」——压住 Shopee 透底但仍保留半透明质感 */
+  p.backgroundColor = AhaColor(16, 18, 24, 0.75);   // v0.5.28 半透明（Ajie 同款质感）
   p.layer.cornerRadius = 14;
   p.clipsToBounds = YES;
   p.layer.borderWidth = 1;
@@ -1969,7 +1969,7 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   // 日志窗（v0.5.30：弃用 UITextView 滚动——高频重写+折行会让 contentOffset 滚出内容区变白屏；
   // 改底部锚定 UILabel：内容永远从底部往上排，超高就裁掉最旧的，物理上不可能出现空白）
   self.logBox = [[UIView alloc] initWithFrame:CGRectZero];
-  self.logBox.backgroundColor = AhaColor(0, 0, 0, 0.35);
+  self.logBox.backgroundColor = AhaColor(0, 0, 0, 0.45);   /* v0.5.36b 0.35→0.45 同步微加深 */
   self.logBox.layer.cornerRadius = 8;
   self.logBox.clipsToBounds = YES;
   [p addSubview:self.logBox];
