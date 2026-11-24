@@ -181,7 +181,7 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
   // v0.5.15 诊断：网络层失败不再静默——get_pc 相关错误打出来，跑一轮就知道
   // 到底是「请求没发出」还是「发出但网络错误」（用户关梯子实验：症状一样，必须区分开）
   NSString *u = req.URL.absoluteString ?: @"";
-  BOOL isPc = ([u rangeOfString:kGetPcMark].location != NSNotFound);
+  BOOL isPc = ([u rangeOfString:kPdpMark].location != NSNotFound);   // v0.5.17=Ajie 1:1：任意 /api/v4/pdp/ 端点，不只 get_pc
   if (err) {
     if (isPc) ahaLog(@"w", [NSString stringWithFormat:@"get_pc 网络错误：%@ (%ld)",
         err.localizedDescription ?: @"未知", (long)err.code]);
@@ -212,14 +212,27 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
   }
   if (gPool) { dispatch_async(gPool.q, ^{ gPool.risk = NO; gPool.failStreak = 0; }); }
 
-  // —— 存副本（shop/item 从 query 取）——
+  // —— 存副本（shop/item：URL query 优先，缺了按 Ajie 同款从 JSON data.item 补；——
+  //     266900002 等错误回包照常提交 = Ajie inspectCapturedData 同款）——
   NSURLComponents *uc = [NSURLComponents componentsWithURL:req.URL resolvingAgainstBaseURL:NO];
   NSString *shop = nil, *item = nil;
   for (NSURLQueryItem *qi in uc.queryItems) {
     if ([qi.name isEqualToString:@"shop_id"]) shop = qi.value;
     if ([qi.name isEqualToString:@"item_id"]) item = qi.value;
   }
-  if (shop.length && item.length) [self storeBody:body shop:shop item:item];
+  if (!shop.length || !item.length) {
+    NSData *d = [body dataUsingEncoding:NSUTF8StringEncoding];
+    id obj = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+      id data = obj[@"data"], it = [data isKindOfClass:[NSDictionary class]] ? data[@"item"] : nil;
+      if ([it isKindOfClass:[NSDictionary class]]) {
+        if (!item.length) item = [NSString stringWithFormat:@"%@", it[@"item_id"] ?: it[@"itemid"] ?: @""];
+        if (!shop.length) shop = [NSString stringWithFormat:@"%@", it[@"shop_id"] ?: it[@"shopid"] ?: @""];
+      }
+    }
+  }
+  if (shop.length && item.length && ![shop isEqualToString:@"(null)"] && ![item isEqualToString:@"(null)"])
+    [self storeBody:body shop:shop item:item];
 }
 
 - (void)storeBody:(NSString *)body shop:(NSString *)shop item:(NSString *)item {
@@ -287,7 +300,7 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
   if (!gPool || body.length == 0) return;
   @try {
     // u 为空 = shp 自家回调通道（拿不到 NSURL），交给下面的形状识别把关
-    if (u.length && [u rangeOfString:kGetPcMark].location == NSNotFound) return;
+    if (u.length && [u rangeOfString:kPdpMark].location == NSNotFound) return;   // v0.5.17：任意 /api/v4/pdp/ 端点
     if (req && req.allHTTPHeaderFields.count) [self rememberContext:req];
 
     // 风控识别（Ajie 判据；delegate 通道拿不到 HTTP 码，只看回包内容）
@@ -784,6 +797,28 @@ static void ahaDelegateDidReceiveData(id self, SEL _cmd, id module, id requestLi
           if (first) [gTaskBuf removeObjectForKey:first];
         }
       }
+    } else if ([requestLike respondsToSelector:NSSelectorFromString(@"data")]) {
+      // Ajie 1:1（0x42e28 实证）：shp 请求对象自带 data 属性 → 直接 appendData 累积
+      SEL selData = NSSelectorFromString(@"data");
+      NSMutableData *buf = ((id (*)(id, SEL))objc_msgSend)(requestLike, selData);
+      if (![buf isKindOfClass:[NSMutableData class]]) {
+        SEL selSetData = NSSelectorFromString(@"setData:");
+        if ([requestLike respondsToSelector:selSetData]) {
+          buf = [NSMutableData data];
+          ((void (*)(id, SEL, id))objc_msgSend)(requestLike, selSetData, buf);
+        }
+      }
+      if ([buf isKindOfClass:[NSMutableData class]]) {
+        [buf appendData:data];
+      } else if ([requestLike respondsToSelector:@selector(objectForKeyedSubscript:)] &&
+                 [requestLike respondsToSelector:@selector(setObject:forKeyedSubscript:)]) {
+        NSMutableData *buf2 = [requestLike objectForKeyedSubscript:kAhaBufKey];
+        if (![buf2 isKindOfClass:[NSMutableData class]]) {
+          buf2 = [NSMutableData data];
+          [requestLike setObject:buf2 forKeyedSubscript:kAhaBufKey];
+        }
+        [buf2 appendData:data];
+      }
     } else if ([requestLike respondsToSelector:@selector(objectForKeyedSubscript:)] &&
                [requestLike respondsToSelector:@selector(setObject:forKeyedSubscript:)]) {
       // Ajie 同款：shp 请求对象是字典式的，累积字节直接挂它身上
@@ -806,7 +841,7 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
       // v0.5.15 诊断：网络层失败不再静默（URLSession 路径能拿到 URL，只记 pdp 的）
       if ([requestLike isKindOfClass:[NSURLSessionTask class]]) {
         NSString *u = ((NSURLSessionTask *)requestLike).currentRequest.URL.absoluteString ?: @"";
-        if (u.length && [u rangeOfString:kGetPcMark].location != NSNotFound)
+        if (u.length && [u rangeOfString:kPdpMark].location != NSNotFound)
           ahaLog(@"w", [NSString stringWithFormat:@"get_pc 网络错误（delegate 通道）：%@ (%ld)",
               error.localizedDescription ?: @"未知", (long)error.code]);
       }
@@ -815,13 +850,25 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
     if (!gPool) return;
     NSData *bufData = nil;
     BOOL isTask = [requestLike isKindOfClass:[NSURLSessionTask class]];
+    // v0.5.17 = Ajie 1:1（0x431d4 实证）：按 responseData/data/rawData/bodyData 四键读累积，
+    // 外加我们自己的 piggyback 键；再试 data 属性（didReceiveData 的 Ajie 同款累积位）
     if ([requestLike respondsToSelector:@selector(objectForKeyedSubscript:)]) {
-      id pig = [requestLike objectForKeyedSubscript:kAhaBufKey];
-      if ([pig isKindOfClass:[NSData class]]) {
-        bufData = [NSData dataWithData:pig];
-        SEL selRemove = NSSelectorFromString(@"removeObjectForKeyedSubscript:");
-        if ([requestLike respondsToSelector:selRemove])
-          ((void (*)(id, SEL, id))objc_msgSend)(requestLike, selRemove, kAhaBufKey); // 取完即清，防重复投递
+      SEL selRemove = NSSelectorFromString(@"removeObjectForKeyedSubscript:");
+      for (NSString *k in @[@"responseData", @"data", @"rawData", @"bodyData", kAhaBufKey]) {
+        id pig = [requestLike objectForKeyedSubscript:k];
+        if ([pig isKindOfClass:[NSData class]] && pig.length) {
+          bufData = [NSData dataWithData:pig];
+          if ([k isEqualToString:kAhaBufKey] && [requestLike respondsToSelector:selRemove])
+            ((void (*)(id, SEL, id))objc_msgSend)(requestLike, selRemove, kAhaBufKey); // 取完即清，防重复投递
+          break;
+        }
+      }
+    }
+    if (!bufData) {
+      SEL selData = NSSelectorFromString(@"data");
+      if (!isTask && [requestLike respondsToSelector:selData]) {
+        id buf = ((id (*)(id, SEL))objc_msgSend)(requestLike, selData);
+        if ([buf isKindOfClass:[NSData class]] && buf.length) bufData = [NSData dataWithData:buf];
       }
     }
     if (!bufData && isTask) {
@@ -844,9 +891,23 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
     if (isTask) {
       req = ((NSURLSessionTask *)requestLike).currentRequest;
       u = req.URL.absoluteString ?: @"";
-      if (u.length && [u rangeOfString:kGetPcMark].location == NSNotFound) return;
+    } else {
+      // v0.5.17 = Ajie sub_0xa3e4 同款：从 shp 请求对象提取 URL（.URL / .request.URL）
+      SEL selURL = NSSelectorFromString(@"URL");
+      id urlObj = nil;
+      if ([requestLike respondsToSelector:selURL])
+        urlObj = ((id (*)(id, SEL))objc_msgSend)(requestLike, selURL);
+      if (![urlObj isKindOfClass:[NSURL class]]) {
+        SEL selReq = NSSelectorFromString(@"request");
+        if ([requestLike respondsToSelector:selReq]) {
+          id rq = ((id (*)(id, SEL))objc_msgSend)(requestLike, selReq);
+          if ([rq respondsToSelector:selURL]) urlObj = ((id (*)(id, SEL))objc_msgSend)(rq, selURL);
+        }
+      }
+      if ([urlObj isKindOfClass:[NSURL class]]) u = urlObj.absoluteString ?: @"";
     }
-    // shp 通道拿不到 URL：u 传空串，inspectRawBody 跳过 URL 过滤、只靠形状识别把关
+    // URL 已知且不是 pdp 端点 → 跳过；URL 未知（空串）→ inspectRawBody 只靠形状识别把关
+    if (u.length && [u rangeOfString:kPdpMark].location == NSNotFound) return;
     NSString *body = [[NSString alloc] initWithData:bufData encoding:NSUTF8StringEncoding];
     [[AHACapture shared] inspectRawBody:body url:u request:req];
   } @catch (__unused NSException *e) { /* 静默 */ }
