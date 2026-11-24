@@ -152,17 +152,25 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
 
 - (void)inspectData:(NSData *)data response:(NSURLResponse *)resp
             request:(NSURLRequest *)req error:(NSError *)err {
-  if (err || !data.length) return;
+  // v0.5.15 诊断：网络层失败不再静默——get_pc 相关错误打出来，跑一轮就知道
+  // 到底是「请求没发出」还是「发出但网络错误」（用户关梯子实验：症状一样，必须区分开）
   NSString *u = req.URL.absoluteString ?: @"";
-  if ([u rangeOfString:kGetPcMark].location == NSNotFound) return;
+  BOOL isPc = ([u rangeOfString:kGetPcMark].location != NSNotFound);
+  if (err) {
+    if (isPc) ahaLog(@"w", [NSString stringWithFormat:@"get_pc 网络错误：%@ (%ld)",
+        err.localizedDescription ?: @"未知", (long)err.code]);
+    return;
+  }
+  if (!data.length || !isPc) return;
   NSHTTPURLResponse *hr = [resp isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)resp : nil;
   NSInteger code = hr.statusCode;
   NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
   if (!body.length) return;
 
   // —— 风控识别（Ajie 反汇编 1:1：90309999=验证墙自动停；266900002=按正常响应提交；——
-  //     403 只是直连/网络失败，不进风控。Ajie 全程无弹窗）——
-  if ([body containsString:@"90309999"]) {
+  //     403/418 是 SGW 拒直调重放，不算账号风控。v0.5.15：风控判定放 200 之后，
+  //     直调 418 带 90309999 不再把面板打成「已风控」）——
+  if (code == 200 && [body containsString:@"90309999"]) {
     ahaLog(@"e", @"PDP返回90309999验证，已暂停");
     if (gPool) dispatch_async(gPool.q, ^{ [gPool riskStop]; });
     ahaRefreshUI();
@@ -173,7 +181,7 @@ static void ahaRefreshUI(void);                           // 主线程刷面板
     return;
   }
   if (code != 200) {
-    ahaLog(@"w", [NSString stringWithFormat:@"get_pc HTTP %ld，未采", (long)code]);
+    ahaLog(@"w", [NSString stringWithFormat:@"get_pc 回 HTTP %ld（请求被 SGW 拒，不计入风控）", (long)code]);
     return;
   }
   if (gPool) { dispatch_async(gPool.q, ^{ gPool.risk = NO; gPool.failStreak = 0; }); }
@@ -606,7 +614,10 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
   NSString *u = request.URL.absoluteString ?: @"";
   ahaObserveURL(u);
   BOOL isPdp = ([u rangeOfString:kPdpMark].location != NSNotFound);
-  if (isPdp) [[AHACapture shared] rememberContext:request];
+  if (isPdp) {
+    [[AHACapture shared] rememberContext:request];
+    ahaLog(@"i", @"get_pc 请求已发出（completionHandler 通道）");   // v0.5.15 诊断：证明请求真的发出去了
+  }
   if (!isPdp || !handler) return %orig;
   NSURLRequest *reqCopy = [request copy];
   return %orig(request, ^(NSData *d, NSURLResponse *r, NSError *e) {
@@ -619,13 +630,16 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
   NSString *u = URL.absoluteString ?: @"";
   ahaObserveURL(u);
   BOOL isPdp = ([u rangeOfString:kPdpMark].location != NSNotFound);
-  if (!isPdp || !handler) return %orig;
-  NSURLRequest *req = [NSURLRequest requestWithURL:URL];
-  [[AHACapture shared] rememberContext:req];
-  return %orig(URL, ^(NSData *d, NSURLResponse *r, NSError *e) {
-    [[AHACapture shared] inspectData:d response:r request:req error:e];
-    handler(d, r, e);
-  });
+  if (isPdp) {
+    NSURLRequest *req = [NSURLRequest requestWithURL:URL];
+    [[AHACapture shared] rememberContext:req];
+    ahaLog(@"i", @"get_pc 请求已发出（completionHandler 通道）");   // v0.5.15 诊断
+    return %orig(URL, ^(NSData *d, NSURLResponse *r, NSError *e) {
+      [[AHACapture shared] inspectData:d response:r request:req error:e];
+      if (handler) handler(d, r, e);
+    });
+  }
+  return %orig;
 }
 %end
 
@@ -759,7 +773,17 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
   if (orig)
     ((void (*)(id, SEL, id, id, NSError *))orig)(self, _cmd, module, requestLike, error); // Ajie 同序
   @try {
-    if (error || !gPool) return;             // Ajie 同款：有错不处理
+    if (error) {
+      // v0.5.15 诊断：网络层失败不再静默（URLSession 路径能拿到 URL，只记 pdp 的）
+      if ([requestLike isKindOfClass:[NSURLSessionTask class]]) {
+        NSString *u = ((NSURLSessionTask *)requestLike).currentRequest.URL.absoluteString ?: @"";
+        if (u.length && [u rangeOfString:kGetPcMark].location != NSNotFound)
+          ahaLog(@"w", [NSString stringWithFormat:@"get_pc 网络错误（delegate 通道）：%@ (%ld)",
+              error.localizedDescription ?: @"未知", (long)error.code]);
+      }
+      return;
+    }
+    if (!gPool) return;
     NSData *bufData = nil;
     BOOL isTask = [requestLike isKindOfClass:[NSURLSessionTask class]];
     if ([requestLike respondsToSelector:@selector(objectForKeyedSubscript:)]) {
@@ -780,6 +804,12 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
       }
     }
     if (bufData.length == 0) return;
+    // v0.5.15 诊断：shp 通道没有 URL 可判，用前 2 条证明通道本身活着（不刷屏）
+    static int sShpAlive = 0;
+    if (!isTask && sShpAlive < 2) {
+      sShpAlive++;
+      ahaLog(@"i", [NSString stringWithFormat:@"shp 自家通道收到回包 %lu 字节", (unsigned long)bufData.length]);
+    }
     NSString *u = @"";
     NSURLRequest *req = nil;
     if (isTask) {
@@ -1336,7 +1366,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
     });
     dispatch_async(self.q, ^{
       if (!body) {
-        ahaLog(@"w", @"20 秒没等到商品回包（页面没开/没加载完），任务回池");
+        ahaLog(@"w", @"15 秒没等到商品回包（页面没开/没加载完），任务回池");
         self.taskLine = @"";
         ahaRefreshUI();
         [self api:@"/api/pool/report" method:@"POST"
