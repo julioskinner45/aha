@@ -331,20 +331,7 @@ static UIWindow *ahaOwnWin(void) {
   return ((id(*)(id, SEL))objc_msgSend)((id)gUI, s);
 }
 
-// Shopee 自己的导航控制器（回根用）
-static UINavigationController *ahaShopeeNav(void) {
-  UIWindow *own = ahaOwnWin();
-  for (UIWindow *w in [UIApplication sharedApplication].windows) {
-    if (w == own) continue;
-    UIViewController *vc = w.rootViewController;
-    if (!vc) continue;
-    if ([vc isKindOfClass:[UITabBarController class]])
-      vc = [(UITabBarController *)vc selectedViewController];
-    if ([vc isKindOfClass:[UINavigationController class]])
-      return (UINavigationController *)vc;
-  }
-  return nil;
-}
+// （v0.5.13：旧 ahaShopeeNav 已删——回根统一走 ahaPopToRootIfNeeded，Ajie 0x21db0 1:1）
 
 // —— NSInvocation 安全调用器（Ajie invokeSelector:onTarget:arguments: 逐字复刻）：
 // 签名驱动、NSNull 转 NULL、标量按类型宽度取值、结构体一律拒绝。
