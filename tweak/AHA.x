@@ -1099,6 +1099,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
   self.resting = NO;
   self.taskLine = @"";
   ahaRefreshUI();
+  [self helloTick];   // v0.5.33 立即上报风控阶段（不等 10s 心跳）
 }
 
 // —— 连续无数据（Ajie handleNoDataCapture 1:1）：
@@ -1170,11 +1171,21 @@ static void ahaLog(NSString *lv, NSString *msg) {
   }];
 }
 
-// —— 心跳（10s，运行中才发）——
+// —— 心跳（10s，常驻；v0.5.33 起带 phase 上报设备状态）——
+// 中枢 BAD_WIN_PHASES：slider/risk/net/login/stopped（坏阶段剔除出有效窗口，不为它配货）；
+// 正常阶段：ok/take/nav/wait/submit/gap。设备状态映射：
+//   risk=风控自动停  login=未连接/掉登  stopped=循环已停  gap=休息中  ok=跑单中
 - (void)helloTick {
-  if (!self.running || !self.token) return;
+  NSString *pid = [self.cfg[@"pid"] stringByTrimmingCharactersInSet:
+      [NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+  if (pid.length == 0 || self.base.length == 0) return;
+  NSString *ph = @"ok";
+  if (self.risk) ph = @"risk";
+  else if (!self.token) ph = @"login";
+  else if (!self.running) ph = @"stopped";
+  else if (self.resting) ph = @"gap";
   [self api:@"/api/pool/hello" method:@"POST"
-      body:@{ @"profileId": self.cfg[@"pid"] ?: @"" } done:nil];
+      body:@{ @"profileId": pid, @"phase": ph } done:nil];
 }
 
 // —— 开始 / 停止 ——
@@ -1189,6 +1200,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
     self.running = YES; self.resting = NO; self.risk = NO; self.failStreak = 0;
     ahaLog(@"s", @"领单循环已开始");
     ahaRefreshUI();
+    [self helloTick];   // v0.5.33 立即恢复有效窗口（不等 10s 心跳）
     [self takeOnce];
   });
 }
@@ -1199,6 +1211,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
     self.taskLine = @"";
     ahaLog(@"w", @"循环已停止");
     ahaRefreshUI();
+    [self helloTick];   // v0.5.33 立即上报 stopped 阶段
   });
 }
 
