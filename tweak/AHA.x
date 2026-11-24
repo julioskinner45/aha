@@ -1464,6 +1464,11 @@ static void ahaLog(NSString *lv, NSString *msg) {
     }
   }
   self.taskLine = [NSString stringWithFormat:@"#%@ [%@] item %@ · 打开商品页", taskId, acct, itemId];
+  // v0.5.26 提交 url 必须与 PC 中控台 collectBuildPcUrl 插件同款构造规则一致：
+  // get_pc 接口 URL（聚星按这个格式收单）；此前直交 taskUrl（product/ 商品页）= 偏离同款
+  NSString *pcUrl = [NSString stringWithFormat:
+      @"https://shopee.tw/api/v4/pdp/get_pc?display_model_id=0&item_id=%@&model_selection_logic=3&shop_id=%@&tz_offset_in_minutes=480&detail_level=0",
+      itemId, shopId];
   ahaStep(@"任务:领到单");
   ahaLog(@"s", [NSString stringWithFormat:@"领到单 #%@ [%@] item %@ shop %@", taskId, acct, itemId, shopId]);
   ahaRefreshUI();
@@ -1579,7 +1584,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
           taskId, via, (unsigned long)[body lengthOfBytesUsingEncoding:NSUTF8StringEncoding] / 1024];
       ahaRefreshUI();
       ahaStep(@"任务:提交");
-      [self submit:taskId taskUrl:taskUrl result:body jxServer:jxServer token:subTok];
+      [self submit:taskId taskUrl:pcUrl result:body jxServer:jxServer token:subTok];
     });
   });
 }
@@ -1646,16 +1651,29 @@ static void ahaLog(NSString *lv, NSString *msg) {
     [[sess dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
       dispatch_async(self.q, ^{
         BOOL ok = NO;
-        NSString *codeTxt = @"无回包";
-        if (!e && d) {
-          id o = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
-          id code = [o isKindOfClass:[NSDictionary class]] ? (o[@"code"] ?: [o valueForKeyPath:@"data.code"]) : nil;
-          ok = [code isEqual:@200] || [code isEqual:@(200)];
-          codeTxt = [NSString stringWithFormat:@"%@", code ?: @"格式异常"];
+        NSString *codeTxt = @"无回包", *msgTxt = @"";
+        // v0.5.26 回包判定实证（重交探针）：{"code":"200","data":{"code":"ERROR","msg":"结果有误"},"msg":null}
+        // 外层 code 恒为字符串信封 "200"（NSString，老 isEqual:@200 的 NSNumber 比较必假）；
+        // 真判定在 data.code（成功="200"，失败="ERROR"+msg）。判定与 PC collectSubmit 同构。
+        NSString *raw = (d.length ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : @"") ?: @"";
+        id o = raw.length ? [NSJSONSerialization JSONObjectWithData:[raw dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil] : nil;
+        if ([o isKindOfClass:[NSDictionary class]]) {
+          NSDictionary *dt = [o[@"data"] isKindOfClass:[NSDictionary class]] ? (NSDictionary *)o[@"data"] : nil;
+          codeTxt = dt ? [NSString stringWithFormat:@"%@", dt[@"code"] ?: @""] : @"";
+          id m = dt ? dt[@"msg"] : o[@"msg"];
+          msgTxt = [m isKindOfClass:[NSString class]] ? (NSString *)m : @"";
+          ok = [codeTxt isEqualToString:@"200"];
+        } else if (raw.length) {
+          codeTxt = raw.length > 100 ? [[raw substringToIndex:100] stringByAppendingString:@"…"] : raw;
+        }
+        if (!ok && raw.length) {
+          if ([raw containsString:@"或者已经完成过了"]) ok = YES;
+          else if (([raw containsString:@"已保存"] || [raw containsString:@"success"])
+                   && ![codeTxt isEqualToString:@"ERROR"]) ok = YES;
         }
         ahaLog(ok ? @"s" : @"i",
             [NSString stringWithFormat:@"#%@ 聚星直传%@", taskId,
-              ok ? @"成功" : [NSString stringWithFormat:@"失败(code=%@)，转中枢代交", codeTxt]]);
+              ok ? @"成功" : [NSString stringWithFormat:@"失败(data.code=%@ msg=%@)，转中枢代交", codeTxt, msgTxt]]);
         if (ok) [self markOk:taskId via:@"聚星直传"];
         else [self hubSubmit:taskId taskUrl:taskUrl result:result];
       });
