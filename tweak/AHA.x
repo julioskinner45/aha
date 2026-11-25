@@ -119,6 +119,7 @@ static void ahaObserveURL(NSString *u) {
 }
 // v0.5.28：诊断期结束，会话 delegate 类名探针已删（采集链路已通）
 static void ahaRefreshUI(void);                           // 主线程刷面板
+static void ahaRefreshNow(void);                          // v0.5.43 绕过 250ms 合并窗，立刻刷（按钮状态变更用）
 static void ahaStep(NSString *tag);                       // v0.5.34 前置声明（钩子门面包屑在定义之前调用）
 
 #pragma mark - 池客户端（接口声明）
@@ -127,6 +128,7 @@ static void ahaStep(NSString *tag);                       // v0.5.34 前置声�
 @property(nonatomic, strong) NSMutableDictionary *cfg;
 @property(nonatomic, strong) NSDate *lastRiskAlert;
 @property(nonatomic, assign) BOOL running, connected, resting, risk;
+@property(nonatomic, assign) BOOL connecting;   // v0.5.43 点了开始→登录回来之间：按钮亮「连接中」，防重复点
 @property(nonatomic, assign) NSInteger taken, ok, failStreak;   // 连续无数据计数（Ajie consecutivePDPFailures 1:1）
 @property(nonatomic, copy) NSString *me, *token, *taskLine;
 @property(nonatomic, readonly) dispatch_queue_t q;
@@ -1064,6 +1066,7 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
 
 - (NSString *)statusText {
   if (self.risk) return @"● 此账号已风控！";
+  if (self.connecting) return @"● 连接中…";
   if (!self.connected) return @"● 未连接";
   if (!self.running) return [NSString stringWithFormat:@"● 已连接 %@（待机）", self.me ?: @""];
   if (self.resting) return @"● 休息中";
@@ -1165,16 +1168,18 @@ static void ahaLog(NSString *lv, NSString *msg) {
       body:@{ @"name": u }
       done:^(NSDictionary *j, NSError *e) {
     dispatch_async(self.q, ^{
+      self.connecting = NO;   // v0.5.43 登录已有结果（成或败），按钮不再锁在「连接中」
       if (j && [j[@"ok"] boolValue]) {
         self.token = j[@"token"];
         self.me = u;
         self.connected = YES;
         ahaLog(@"s", [NSString stringWithFormat:@"已连接 %@（敞口模式 · 池隔离）", self.me]);
-        if (after) after();
+        if (after) after();          // beginRun 内部会立即刷新按钮为「停止采集」
       } else {
         self.connected = NO; self.token = nil;
         ahaLog(@"e", [NSString stringWithFormat:@"登录失败：%@",
             j[@"error"] ?: (e.localizedDescription ?: @"网络不通")]);
+        ahaRefreshNow();             // v0.5.43 失败立刻恢复按钮，别一直卡在「连接中」
       }
       ahaRefreshUI();
     });
@@ -1201,15 +1206,21 @@ static void ahaLog(NSString *lv, NSString *msg) {
 // —— 开始 / 停止 ——
 - (void)startLoop {
   if (gPure) { ahaLog(@"w", @"当前是纯净模式（无采集钩子），请先到设置⚙切到完整模式并重启虾皮"); ahaRefreshUI(); return; }
-  if (!self.connected) { [self connect:^{ [self beginRun]; }]; return; }
+  if (!self.connected) {
+    /* v0.5.43 点击即反馈：先把按钮切成「连接中」再走登录，避免点了像没反应 */
+    if (!self.connecting) { self.connecting = YES; ahaRefreshNow(); }
+    [self connect:^{ [self beginRun]; }];
+    return;
+  }
   [self beginRun];
 }
 - (void)beginRun {
   dispatch_async(self.q, ^{
     if (self.running) return;
+    self.connecting = NO;
     self.running = YES; self.resting = NO; self.risk = NO; self.failStreak = 0;
     ahaLog(@"s", @"领单循环已开始");
-    ahaRefreshUI();
+    ahaRefreshNow();    // v0.5.43 立即变「停止采集」，不再等 250ms 合并窗
     [self helloTick];   // v0.5.33 立即恢复有效窗口（不等 10s 心跳）
     [self takeOnce];
   });
@@ -1218,9 +1229,10 @@ static void ahaLog(NSString *lv, NSString *msg) {
   dispatch_async(self.q, ^{
     if (!self.running) return;
     self.running = NO;
-    self.taskLine = @"";
+    self.connecting = NO;
+    self.taskLine = @"已停止（进行中的单会做完）";
     ahaLog(@"w", @"循环已停止");
-    ahaRefreshUI();
+    ahaRefreshNow();    // v0.5.43 立即变「开始采集」
     [self helloTick];   // v0.5.33 立即上报 stopped 阶段
   });
 }
@@ -1974,6 +1986,11 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
     if (gPool.running) [gPool stopLoop];
     else [gPool startLoop];          // 未登录会自动先登录再开始
   });
+  /* v0.5.43 按下即反馈：手指一碰按钮就变暗、抬手恢复。
+     以前点下去到按钮换文案要等 250ms 合并刷新，手感像「没点到」。 */
+  [self.startBtn addTarget:self action:@selector(btnPress:) forControlEvents:UIControlEventTouchDown];
+  [self.startBtn addTarget:self action:@selector(btnRelease:) forControlEvents:UIControlEventTouchUpInside
+      | UIControlEventTouchUpOutside | UIControlEventTouchCancel | UIControlEventTouchDragExit];
   ahaTap(self.resetBtn, ^{ [self.panel endEditing:YES]; [gPool resetCounters]; ahaLog(@"i", @"计数已清零"); });
 
   // 输入框预填（间隔默认 0-0；休息按分钟显示，内部存秒）+ 失焦保存
@@ -2132,6 +2149,9 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   self.rh.frame       = CGRectMake(w - 20, h - 20, 20, 20);
 }
 
+- (void)btnPress:(UIButton *)b { b.alpha = 0.72; }
+- (void)btnRelease:(UIButton *)b { b.alpha = 1.0; }
+
 - (void)refresh {
   if (!self.panel) return;
   self.statusLabel.text = gPool.statusText;
@@ -2159,12 +2179,20 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   self.counterLabel.text = gPool.counterText;
   self.taskLabel.text = gPool.taskText;
   // 大按钮 = 开始/停止 同一按钮
-  if (gPool.running) {
-    [self.startBtn setTitle:@"■ 停止采集" forState:UIControlStateNormal];
-    self.startBtn.backgroundColor = AhaColor(200, 60, 56, 1);
+  if (gPool.connecting) {                 // v0.5.43 登录中：变灰锁住，防止连点开多个登录
+    self.startBtn.enabled = NO;
+    self.startBtn.alpha = 1.0;            // 按下态残留清理（禁用时收不到 touchUp）
+    [self.startBtn setTitle:@"⏳ 连接中…" forState:UIControlStateNormal];
+    self.startBtn.backgroundColor = AhaColor(110, 110, 118, 1);
   } else {
-    [self.startBtn setTitle:@"▶ 开始采集" forState:UIControlStateNormal];
-    self.startBtn.backgroundColor = AhaColor(34, 170, 90, 1);
+    self.startBtn.enabled = YES;
+    if (gPool.running) {
+      [self.startBtn setTitle:@"■ 停止采集" forState:UIControlStateNormal];
+      self.startBtn.backgroundColor = AhaColor(200, 60, 56, 1);
+    } else {
+      [self.startBtn setTitle:@"▶ 开始采集" forState:UIControlStateNormal];
+      self.startBtn.backgroundColor = AhaColor(34, 170, 90, 1);
+    }
   }
   self.miniInfo.text = [NSString stringWithFormat:@"成 %ld", (long)gPool.ok];
   // v0.5.30 日志渲染：底部锚定 UILabel（不滚动、不设 contentOffset，修「日志消失」）
@@ -2199,6 +2227,14 @@ static void ahaRefreshUI(void) {
     dispatch_resume(timer);
   });
   pending = YES;   // 到点统一刷；立即刷会被 250ms 合并窗吸收
+}
+
+/* v0.5.43 立即刷新：只给「开始/停止/连接结果」这类状态切换用。
+   日志仍走 250ms 合并（防乱跳），这里不合并——点了按钮必须马上看到变化。 */
+static void ahaRefreshNow(void) {
+  if (!gUI) return;
+  if ([NSThread isMainThread]) { [gUI refresh]; return; }
+  dispatch_async(dispatch_get_main_queue(), ^{ if (gUI) [gUI refresh]; });
 }
 
 #pragma mark - 面板容器实现（要在 AHAUI 接口之后才能调 layoutPanel）
