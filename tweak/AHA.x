@@ -1645,7 +1645,9 @@ static void ahaLog(NSString *lv, NSString *msg) {
 
 // —— v0.5.32 第二刀：Ajie 设备号同款——稳定 device_id（UserDefaults 持久化），
 // device_id 与 fingerprint_key 共用同一值（Ajie 0x34f38~0x34fd8 两次取 deviceID 的实测结构）
-static NSString *ahaDeviceID(void) {
+// v0.5.41 手机直连已删（全部走中枢代交），device_id 改由中枢统一生成下发；
+// 本机持久设备号保留备用（__attribute__((unused)) 防 -Werror）
+__attribute__((unused)) static NSString *ahaDeviceID(void) {
   static NSString *did = nil;
   static dispatch_once_t once;
   dispatch_once(&once, ^{
@@ -1658,87 +1660,31 @@ static NSString *ahaDeviceID(void) {
   });
   return did;
 }
-static NSString *ahaNewUuid(void) { return [[NSUUID UUID] UUIDString]; }
+__attribute__((unused)) static NSString *ahaNewUuid(void) { return [[NSUUID UUID] UUIDString]; }
 
-// —— 提交：优先聚星直传（省跨境流量），失败回退中枢代交 ——
+// —— v0.5.41 提交：全部走中枢代交（用户拍板：不要手机直连兜底）——
+// 聚星 task/submit/v2 由中枢调用并判定回包；手机只显示中枢回传的成败。
+// 中枢记账（bump submitted / acctDay / winStats）也在同一处，账本唯一不再有双路径分歧。
 - (void)submit:(NSString *)taskId taskUrl:(NSString *)taskUrl result:(NSString *)result
         itemId:(NSString *)itemId acct:(NSString *)acct
       jxServer:(NSString *)jxServer token:(NSString *)token {
-  if (jxServer.length > 8 && token.length > 8) {
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
-        [NSURL URLWithString:[jxServer stringByAppendingString:@"/api/task/submit/v2"]]];
-    req.HTTPMethod = @"POST";
-    req.timeoutInterval = 60;
-    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    [req setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
-    // v0.5.32 报文字段 1:1 对齐 Ajie submitCapturedJSONString（0x34a00~0x352a0 实测取值）：
-    // source='ios_submit' platform='ios' device_type='ios' submit_id=任务号
-    // task_id/deal_id=任务号 trace_id=每次新UUID item_id=商品号
-    // username/accountId=子账号 token=子账号token device_id=fingerprint_key=稳定设备号
-    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:
-        @{ @"appVersion": @"vv2", @"url": taskUrl, @"result": result,
-           @"source": @"ios_submit", @"platform": @"ios", @"device_type": @"ios",
-           @"submit_id": taskId, @"task_id": taskId, @"deal_id": taskId,
-           @"trace_id": [NSString stringWithFormat:@"tr_%@", ahaNewUuid()],
-           @"item_id": itemId, @"username": acct, @"accountId": acct, @"token": token,
-           @"device_id": ahaDeviceID(), @"fingerprint_key": ahaDeviceID(),
-           @"bundle_id": @"com.aha.mobile" } options:0 error:nil];
-    static NSURLSession *sess = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-      sess = AhaSession([NSURLSessionConfiguration ephemeralSessionConfiguration]);   // v0.5.24 隔离
-    });
-    [[sess dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-      dispatch_async(self.q, ^{
-        BOOL ok = NO;
-        NSString *codeTxt = @"无回包", *msgTxt = @"";
-        // v0.5.27 判定实证（19:08 三单聚星完成、回包 data.code=无）：成功回包 data 里没有 code 字段！
-        // 与 PC collectSubmit 同构：信封 code==='200'（字符串）+ 有 data + 非 ERROR；
-        // 失败探针回包 {"code":"200","data":{"code":"ERROR","msg":"结果有误"}}
-        NSString *raw = (d.length ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : @"") ?: @"";
-        NSString *rawHead = raw.length > 80 ? [[raw substringToIndex:80] stringByAppendingString:@"…"] : raw;
-        id o = raw.length ? [NSJSONSerialization JSONObjectWithData:[raw dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil] : nil;
-        if ([o isKindOfClass:[NSDictionary class]]) {
-          NSDictionary *dt = [o[@"data"] isKindOfClass:[NSDictionary class]] ? (NSDictionary *)o[@"data"] : nil;
-          id m = dt ? (dt[@"msg"] ?: o[@"msg"]) : o[@"msg"];
-          msgTxt = [m isKindOfClass:[NSString class]] ? (NSString *)m : @"";
-          NSString *env = [NSString stringWithFormat:@"%@", o[@"code"] ?: @""];
-          NSString *dcs = dt ? [NSString stringWithFormat:@"%@", dt[@"code"] ?: @""] : @"";
-          ok = [env isEqualToString:@"200"] && dt && ![dcs isEqualToString:@"ERROR"];
-          codeTxt = dcs.length ? dcs : (dt ? @"data有(无code)" : @"data无");
-        } else if (raw.length) {
-          codeTxt = rawHead;
-        }
-        if (!ok && raw.length) {
-          if ([raw containsString:@"或者已经完成过了"]) ok = YES;
-          else if (([raw containsString:@"已保存"] || [raw containsString:@"success"])
-                   && ![codeTxt isEqualToString:@"ERROR"]) ok = YES;
-        }
-        if (ok) {
-          [self markOk:taskId via:@"聚星直传" resp:rawHead];
-        } else {
-          // v0.5.30 精简：失败一行，带聚星原因（长原文只留在中枢 audit）
-          NSString *why = msgTxt.length ? msgTxt : (codeTxt.length ? codeTxt : @"无回包");
-          ahaLog(@"w", [NSString stringWithFormat:@"提交失败：%@", why]);
-          [self hubSubmit:taskId taskUrl:taskUrl result:result];
-        }
-      });
-    }] resume];
-  } else {
-    [self hubSubmit:taskId taskUrl:taskUrl result:result];
-  }
+  (void)jxServer; (void)token;   // 领单下发字段保留在签名里（调用点不动），提交一律走中枢
+  [self hubSubmit:taskId taskUrl:taskUrl result:result itemId:itemId acct:acct];
 }
 
-- (void)hubSubmit:(NSString *)taskId taskUrl:(NSString *)taskUrl result:(NSString *)result {
+- (void)hubSubmit:(NSString *)taskId taskUrl:(NSString *)taskUrl result:(NSString *)result
+           itemId:(NSString *)itemId acct:(NSString *)acct {
   [self api:@"/api/pool/submit" method:@"POST"
       body:@{ @"taskId": taskId, @"url": taskUrl, @"result": result,
+              @"itemId": itemId ?: @"", @"acct": acct ?: @"",
               @"profileId": self.cfg[@"pid"] ?: @"" }
       done:^(NSDictionary *j, NSError *e) {
     dispatch_async(self.q, ^{
       if (j && [j[@"ok"] boolValue]) [self markOk:taskId via:@"中枢代交" resp:@""];
       else {
-        ahaLog(@"e", [NSString stringWithFormat:@"提交失败：%@",
-            j[@"error"] ?: (e.localizedDescription ?: @"未知")]);
+        // v0.5.41 失败原因直接用中枢回传的聚星判定（data.code/msg），手机不再自己判
+        NSString *why = j[@"error"] ?: (e.localizedDescription ?: @"未知");
+        ahaLog(@"e", [NSString stringWithFormat:@"提交失败：%@", why]);
         self.taskLine = @"";
         ahaRefreshUI();
         [self api:@"/api/pool/report" method:@"POST"
@@ -1757,11 +1703,7 @@ static NSString *ahaNewUuid(void) { return [[NSUUID UUID] UUIDString]; }
   (void)taskId; (void)via; (void)resp;   // v0.5.30 精简：成功只留一行计数，回包原文不再进面板
   ahaLog(@"s", [NSString stringWithFormat:@"提交成功 %ld", (long)self.ok]);
   ahaRefreshUI();
-  // 聚星直传成功必须回执中枢记账（status=ok → 任务置 done + submitted+1）；
-  // 中枢代交路径由 /api/pool/submit 自己记账，互斥不重复计
-  if ([via isEqualToString:@"聚星直传"])
-    [self api:@"/api/pool/report" method:@"POST"
-        body:@{ @"taskId": taskId, @"profileId": self.cfg[@"pid"] ?: @"", @"status": @"ok" } done:nil];
+  // v0.5.41 全走中枢代交：中枢 /api/pool/submit 自己记账，手机无需再发 ok 回执
   [self scheduleNext:[self randomGap]];
 }
 
