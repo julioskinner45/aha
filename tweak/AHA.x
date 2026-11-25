@@ -1037,6 +1037,17 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     self.taken = (NSInteger)[d integerForKey:@"aha_stat_taken"];
     self.ok    = (NSInteger)[d integerForKey:@"aha_stat_ok"];
+    /* v0.5.43 面板默认宽度 300 → 260（用户令：默认再窄一点）。
+       老设备 cfg 里已经存着 300，只改默认值对它无效，必须迁移一次；
+       只迁「没设过」和「正好等于旧默认 300」的 —— 用户自己拖过的宽度不覆盖。 */
+    {
+      double pw = [_cfg[@"panelW"] doubleValue];
+      if (!_cfg[@"panelWVer"]) {
+        if (pw < 1 || fabs(pw - 300) < 0.5) _cfg[@"panelW"] = @260;
+        _cfg[@"panelWVer"] = @1;
+        [self saveCfg];
+      }
+    }
   }
   return self;
 }
@@ -1837,9 +1848,9 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   self.win.rootViewController = [UIViewController new];
   [self.win makeKeyAndVisible];
 
-  CGFloat w = [gPool.cfg[@"panelW"] doubleValue] ?: 300;
+  CGFloat w = [gPool.cfg[@"panelW"] doubleValue] ?: 260;
   CGFloat h = [gPool.cfg[@"panelH"] doubleValue] ?: 380;
-  if (w < 280 || w > scr.size.width) w = 300;
+  if (w < 240 || w > scr.size.width) w = 260;   // v0.5.43 默认宽度 300→260，最小可拖到 240
   if (h < 330 || h > scr.size.height) h = 380;
   CGFloat x = [gPool.cfg[@"panelX"] doubleValue] ?: 14;
   CGFloat y = [gPool.cfg[@"panelY"] doubleValue] ?: scr.size.height * 0.10;
@@ -2264,7 +2275,7 @@ static void ahaRefreshNow(void) {
     CGPoint t = [g translationInView:self];
     CGFloat scrW = [UIScreen mainScreen].bounds.size.width;
     CGFloat scrH = [UIScreen mainScreen].bounds.size.height;
-    CGFloat w = MIN(MAX(w0 + t.x, 280), scrW - 20);
+    CGFloat w = MIN(MAX(w0 + t.x, 240), scrW - 20);   // v0.5.43 下限 280→240，可拖更窄
     CGFloat h = MIN(MAX(h0 + t.y, 330), scrH - 40);
     self.frame = CGRectMake(self.frame.origin.x, self.frame.origin.y, w, h);
     if (gUI) [gUI layoutPanel];
