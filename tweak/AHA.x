@@ -1045,7 +1045,7 @@ static IMP ahaOrigFor(NSMutableDictionary *dict, id obj) {
   Class cls = object_getClass(obj);
   if (!cls) return NULL;
   NSValue *v = nil;
-  @synchronized (dict) { v = dict[cls]; }
+  @synchronized (dict) { v = dict[(id<NSCopying>)cls]; }
   return v ? (IMP)v.pointerValue : NULL;
 }
 
@@ -1061,8 +1061,8 @@ static void ahaSwizzleDelegate(id delegate) {
     if (!gOrigDoneDict) gOrigDoneDict = [NSMutableDictionary dictionary];
     if (!gTaskBuf)      gTaskBuf      = [NSMutableDictionary dictionary];
     BOOL already = NO;
-    @synchronized (gOrigDataDict) { already = (gOrigDataDict[cls] != nil); }
-    @synchronized (gOrigDoneDict) { already = already || (gOrigDoneDict[cls] != nil); }
+    @synchronized (gOrigDataDict) { already = (gOrigDataDict[(id<NSCopying>)cls] != nil); }
+    @synchronized (gOrigDoneDict) { already = already || (gOrigDoneDict[(id<NSCopying>)cls] != nil); }
     if (already) return;
 
     // v0.5.23 恢复挂钩（v0.5.21 曾全停）：Ajie 同款做法实证无罪——
@@ -1078,11 +1078,11 @@ static void ahaSwizzleDelegate(id delegate) {
     IMP origData = NULL, origDone = NULL;
     if ([delegate respondsToSelector:selData]) {
       MSHookMessageEx(cls, selData, (IMP)ahaDelegateDidReceiveData, &origData);
-      if (origData) @synchronized (gOrigDataDict) { gOrigDataDict[cls] = [NSValue valueWithPointer:origData]; }
+      if (origData) @synchronized (gOrigDataDict) { gOrigDataDict[(id<NSCopying>)cls] = [NSValue valueWithPointer:origData]; }
     }
     if ([delegate respondsToSelector:selDone]) {
       MSHookMessageEx(cls, selDone, (IMP)ahaDelegateDidComplete, &origDone);
-      if (origDone) @synchronized (gOrigDoneDict) { gOrigDoneDict[cls] = [NSValue valueWithPointer:origDone]; }
+      if (origDone) @synchronized (gOrigDoneDict) { gOrigDoneDict[(id<NSCopying>)cls] = [NSValue valueWithPointer:origDone]; }
     }
 
     // v0.5.28 精简：装钩登记不再刷日志（cn/way 仅留作登记标记）
