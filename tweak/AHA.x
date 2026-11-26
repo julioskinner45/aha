@@ -1052,20 +1052,53 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
 //   5) 累积字节优先 piggyback 在 request-like 对象上（Ajie 用 keyed subscript），
 //      URLSession task 挂不上就用 gTaskBuf 表兜底。
 
-// v0.5.45 性能：字典直接用 Class 对象做键——旧版每 chunk 先 NSStringFromClass（一次字符串分配）
-// 再查表，图片/视频 CDN 的高频 chunk 上这笔纯开销每秒成百上千次
-static NSMutableDictionary *gOrigDataDict = nil;   // Class → orig(didReceiveData 系)
-static NSMutableDictionary *gOrigDoneDict = nil;   // Class → orig(didComplete 系)
+// v0.5.48 血雷修复：v0.5.45 曾把这里改成「Class 对象做 NSDictionary 键」做性能优化——
+// Class 不遵守 NSCopying，字典插入抛 NSInvalidArgumentException，又被外层 @catch 静默吞掉
+// → 钩子装上了但原实现 IMP 永远存不进表 → 回包回调找不到 orig、直接不转发
+// → app 自己的网络回调全断 → 首页永远等数据 = 白屏 + 整屏点不动（实机复现）。
+// 现改为定长 C 表（Class 指针直接比对）：零分配、零 NSCopying 依赖，比两种字典写法都快。
+#define AHA_MAX_SWZ 32
+static Class sSwzDataCls[AHA_MAX_SWZ]; static IMP sSwzDataImp[AHA_MAX_SWZ]; static int sSwzDataN = 0;
+static Class sSwzDoneCls[AHA_MAX_SWZ]; static IMP sSwzDoneImp[AHA_MAX_SWZ]; static int sSwzDoneN = 0;
+static NSLock *sSwzLockObj = nil;
+static NSLock *sSwzLock(void) {
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{ sSwzLockObj = [[NSLock alloc] init]; });
+  return sSwzLockObj;
+}
 static NSMutableDictionary *gTaskBuf = nil;        // 兜底累积表：task 指针串 → 字节
 static NSString *const kAhaBufKey = @"aha_buf_v1"; // piggyback 键
 
-static IMP ahaOrigFor(NSMutableDictionary *dict, id obj) {
-  if (!dict || !obj) return NULL;
+static BOOL ahaSwzHas(BOOL done, Class cls) {
+  BOOL hit = NO;
+  [sSwzLock() lock];
+  int n = done ? sSwzDoneN : sSwzDataN;
+  Class *cs = done ? sSwzDoneCls : sSwzDataCls;
+  for (int i = 0; i < n; i++) if (cs[i] == cls) { hit = YES; break; }
+  [sSwzLock() unlock];
+  return hit;
+}
+static void ahaSwzPut(BOOL done, Class cls, IMP imp) {
+  if (!cls || !imp) return;
+  [sSwzLock() lock];
+  int *np = done ? &sSwzDoneN : &sSwzDataN;
+  Class *cs = done ? sSwzDoneCls : sSwzDataCls;
+  IMP  *is = done ? sSwzDoneImp : sSwzDataImp;
+  if (*np < AHA_MAX_SWZ) { cs[*np] = cls; is[*np] = imp; (*np)++; }
+  [sSwzLock() unlock];
+}
+static IMP ahaOrigFor(BOOL done, id obj) {
+  if (!obj) return NULL;
   Class cls = object_getClass(obj);
   if (!cls) return NULL;
-  NSValue *v = nil;
-  @synchronized (dict) { v = dict[(id<NSCopying>)cls]; }
-  return v ? (IMP)v.pointerValue : NULL;
+  IMP out = NULL;
+  [sSwzLock() lock];
+  int n = done ? sSwzDoneN : sSwzDataN;
+  Class *cs = done ? sSwzDoneCls : sSwzDataCls;
+  IMP  *is = done ? sSwzDoneImp : sSwzDataImp;
+  for (int i = 0; i < n; i++) if (cs[i] == cls) { out = is[i]; break; }
+  [sSwzLock() unlock];
+  return out;
 }
 
 static void ahaDelegateDidReceiveData(id self, SEL _cmd, id module, id requestLike, NSData *data);
@@ -1076,13 +1109,8 @@ static void ahaSwizzleDelegate(id delegate) {
   @try {
     Class cls = object_getClass(delegate);
     if (!cls) return;
-    if (!gOrigDataDict) gOrigDataDict = [NSMutableDictionary dictionary];
-    if (!gOrigDoneDict) gOrigDoneDict = [NSMutableDictionary dictionary];
-    if (!gTaskBuf)      gTaskBuf      = [NSMutableDictionary dictionary];
-    BOOL already = NO;
-    @synchronized (gOrigDataDict) { already = (gOrigDataDict[(id<NSCopying>)cls] != nil); }
-    @synchronized (gOrigDoneDict) { already = already || (gOrigDoneDict[(id<NSCopying>)cls] != nil); }
-    if (already) return;
+    if (!gTaskBuf) gTaskBuf = [NSMutableDictionary dictionary];
+    if (ahaSwzHas(NO, cls) || ahaSwzHas(YES, cls)) return;   // 该类已挂钩，不重复包
 
     // v0.5.23 恢复挂钩（v0.5.21 曾全停）：Ajie 同款做法实证无罪——
     // Ajie 也对 delegate 类做 MSHookMessageEx（shp 回调优先）且同引擎同类名，照样活着。
@@ -1097,11 +1125,11 @@ static void ahaSwizzleDelegate(id delegate) {
     IMP origData = NULL, origDone = NULL;
     if ([delegate respondsToSelector:selData]) {
       MSHookMessageEx(cls, selData, (IMP)ahaDelegateDidReceiveData, &origData);
-      if (origData) @synchronized (gOrigDataDict) { gOrigDataDict[(id<NSCopying>)cls] = [NSValue valueWithPointer:origData]; }
+      if (origData) ahaSwzPut(NO, cls, origData);
     }
     if ([delegate respondsToSelector:selDone]) {
       MSHookMessageEx(cls, selDone, (IMP)ahaDelegateDidComplete, &origDone);
-      if (origDone) @synchronized (gOrigDoneDict) { gOrigDoneDict[(id<NSCopying>)cls] = [NSValue valueWithPointer:origDone]; }
+      if (origDone) ahaSwzPut(YES, cls, origDone);
     }
 
     // v0.5.28 精简：装钩登记不再刷日志（cn/way 仅留作登记标记）
@@ -1113,7 +1141,7 @@ static void ahaSwizzleDelegate(id delegate) {
 
 static void ahaDelegateDidReceiveData(id self, SEL _cmd, id module, id requestLike, NSData *data) {
   ahaObserveRecv();   // v0.5.19：回包事件计数（delegate 通道）
-  IMP orig = ahaOrigFor(gOrigDataDict, self);
+  IMP orig = ahaOrigFor(NO, self);
   if (orig)
     ((void (*)(id, SEL, id, id, NSData *))orig)(self, _cmd, module, requestLike, data); // Ajie 同序：先过 orig
   @try {
@@ -1181,7 +1209,7 @@ static void ahaDelegateDidReceiveData(id self, SEL _cmd, id module, id requestLi
 }
 
 static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike, NSError *error) {
-  IMP orig = ahaOrigFor(gOrigDoneDict, self);
+  IMP orig = ahaOrigFor(YES, self);
   if (orig)
     ((void (*)(id, SEL, id, id, NSError *))orig)(self, _cmd, module, requestLike, error); // Ajie 同序
   @try {
