@@ -130,6 +130,7 @@ static void ahaStep(NSString *tag);                       // v0.5.34 前置声�
 @property(nonatomic, assign) BOOL running, connected, resting, risk;
 @property(nonatomic, assign) BOOL connecting;   // v0.5.43 点了开始→登录回来之间：按钮亮「连接中」，防重复点
 @property(nonatomic, assign) NSInteger taken, ok, failStreak;   // 连续无数据计数（Ajie consecutivePDPFailures 1:1）
+@property(nonatomic, assign) NSUInteger logVer;   // v0.5.44 日志版本号：渲染跟版本走，不再全文比对
 @property(nonatomic, copy) NSString *me, *token, *taskLine;
 @property(nonatomic, readonly) dispatch_queue_t q;
 - (void)connect:(void (^)(void))after;
@@ -1105,8 +1106,9 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
   if (line.length > 160) line = [[line substringToIndex:160] stringByAppendingString:@"…"];
   @synchronized (_logs) {
     [_logs addObject:line];
-    if (_logs.count > 120) [_logs removeObjectsInRange:NSMakeRange(0, _logs.count - 120)];   // v0.5.28 精简：120 行
+    if (_logs.count > 400) [_logs removeObjectsInRange:NSMakeRange(0, _logs.count - 400)];   // v0.5.44 120→400：跑起来几轮就滚没了（用户报「日志莫名消失」）
   }
+  @synchronized (self) { self.logVer++; }   // v0.5.44 渲染改跟版本号，不再比对全文
   ahaRefreshUI();
 }
 
@@ -1579,22 +1581,45 @@ static void ahaLog(NSString *lv, NSString *msg) {
   NSString *jxServer = [NSString stringWithFormat:@"%@", t[@"jxServer"] ?: @""];
   NSString *subTok   = [NSString stringWithFormat:@"%@", t[@"submitToken"] ?: @""];
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-    // 等 app 自己的 get_pc 回包（最长 15 秒，0.5s 轮询；睡在后台队列，不堵 _q / 主线程）
-    __block NSString *body = nil;
-    for (int i = 0; i < 30 && !body; i++) {
+    /* v0.5.44 截包赛跑（Ajie 思路：不等，抢时间）：
+       等 app 自己的 get_pc 回包（0.5s 轮询），5 秒还没到就**并行**点火 Direct PDP 直连，
+       谁先回用谁 —— 旧版要傻等满 15 秒才开始直连，页面加载一慢单笔任务烧 15~35 秒（用户报「卡很久」）。
+       睡在后台队列，不堵 _q / 主线程。 */
+    __block NSString *capBody = nil, *dirBody = nil;
+    __block BOOL directFired = NO;
+    for (int i = 0; i < 30 && !capBody && !dirBody; i++) {
       [NSThread sleepForTimeInterval:0.5];
-      body = [[AHACapture shared] bodyForShop:shopId item:itemId];
+      capBody = [[AHACapture shared] bodyForShop:shopId item:itemId];
+      if (!directFired && i >= 9) {
+        directFired = YES;
+        ahaLog(@"i", @"截包偏慢，直连并行兜底");
+        ahaStep(@"任务:DirectPDP并行");
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+          NSString *db = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
+          if (db) dirBody = db;
+        });
+      }
     }
+    NSString *body = capBody;
     NSString *via = @"app截包";
+    if (!body && directFired) {
+      for (int i = 0; i < 40 && !dirBody; i++) [NSThread sleepForTimeInterval:0.5];
+      if (dirBody) { body = dirBody; via = @"DirectPDP"; }
+    }
     if (!body) {
-      // app 抓包超时 = 页面没开/没发 get_pc → 计入连续失败（Ajie handleNoDataCapture 语义）
+      // 截包 + 直连双通道都没拿到 = 页面没开/没发 get_pc → 才计连续失败
+      //（旧版「截包超时」就计，直连救回来也白计，连续 2 次还误触风控暂停）
       dispatch_async(self.q, ^{ [self noteCaptureFailure:NO]; });
       dispatch_async(dispatch_get_main_queue(), ^{ ahaObserveFlush(); });   // v0.5.16：超时点把观察窗收集到的 URL 全部刷出
-      ahaLog(@"i", @"明细超时，直调兜底");
-      ahaStep(@"任务:DirectPDP兜底");
-      body = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
-      via = @"DirectPDP";
-      if (!body) ahaLog(@"w", @"直连失败，不计入风控");
+      if (!directFired) {
+        ahaLog(@"i", @"明细超时，直调兜底");
+        ahaStep(@"任务:DirectPDP兜底");
+        body = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
+        via = @"DirectPDP";
+        if (!body) ahaLog(@"w", @"直连失败，不计入风控");
+      } else {
+        ahaLog(@"w", @"直连并行也没拿到，任务回池");   // 并行直连已经试过 20s 超时，不再重复发
+      }
     }
     if (body) dispatch_async(self.q, ^{ self.failStreak = 0; gPool.risk = NO; });
     // 白板自清理：这一单走完（成/败都一样），把商品页退掉——
@@ -1849,9 +1874,9 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   [self.win makeKeyAndVisible];
 
   CGFloat w = [gPool.cfg[@"panelW"] doubleValue] ?: 260;
-  CGFloat h = [gPool.cfg[@"panelH"] doubleValue] ?: 380;
+  CGFloat h = [gPool.cfg[@"panelH"] doubleValue] ?: 420;
   if (w < 240 || w > scr.size.width) w = 260;   // v0.5.43 默认宽度 300→260，最小可拖到 240
-  if (h < 330 || h > scr.size.height) h = 380;
+  if (h < 420 || h > scr.size.height) h = 420;  // v0.5.44 面板最矮 420：老配置里存的 330 会让日志区被挤没（默认 380 也升到 420）
   CGFloat x = [gPool.cfg[@"panelX"] doubleValue] ?: 14;
   CGFloat y = [gPool.cfg[@"panelY"] doubleValue] ?: scr.size.height * 0.10;
   if (x < 0 || x + w > scr.size.width) x = 14;
@@ -2156,7 +2181,10 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   self.startBtn.frame = CGRectMake(12, y, w - 12 * 2 - 52 - 8, 46);
   self.resetBtn.frame = CGRectMake(w - 12 - 52, y, 52, 46);
   y += 54;
-  self.logBox.frame   = CGRectMake(12, y, w - 24, h - y - 14);
+  CGFloat lbh = h - y - 14;
+  if (lbh < 56) lbh = 56;   /* v0.5.44 日志区保底 56px：休息行展开/面板偏矮时不再被挤没（日志「莫名消失」主犯，
+                               旧版 330 高面板+休息行展开算出来是负数，日志框整个没了） */
+  self.logBox.frame   = CGRectMake(12, y, w - 24, lbh);
   self.rh.frame       = CGRectMake(w - 20, h - 20, 20, 20);
 }
 
@@ -2209,17 +2237,20 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   // v0.5.30 日志渲染：底部锚定 UILabel（不滚动、不设 contentOffset，修「日志消失」）
   // v0.5.39 丝滑：文本/框尺寸没变不重排版；拖拽中整个跳过（长日志 sizeThatFits 每 250ms
   // 白算一遍，正好叠在手指移动帧上 = 拖起来卡手），松手后下一轮自动补上
+  // v0.5.44 渲染缓存从「全文比对」改成「版本号比对」：appendLog 每写一行 logVer++，
+  // 拖拽/缩放期间跳过的更新靠版本号必补渲染，杜绝任何边界情况下日志停在旧内容
   NSArray *lines = gPool.logLines;
   NSString *txt = [lines componentsJoinedByString:@"\n"];
   CGFloat bw = self.logBox.bounds.size.width, bh = self.logBox.bounds.size.height;
-  static NSString *sLastTxt; static CGFloat sLastBW = 0, sLastBH = 0;
+  static NSUInteger sLastVer = 0; static BOOL sLastValid = NO;
+  static CGFloat sLastBW = 0, sLastBH = 0;
   if (!gPanelDragging && bw > 1 && bh > 1
-      && (![txt isEqualToString:sLastTxt] || bw != sLastBW || bh != sLastBH)) {
+      && (!sLastValid || gPool.logVer != sLastVer || bw != sLastBW || bh != sLastBH)) {
     if (![txt isEqualToString:self.logLabel.text]) self.logLabel.text = txt;
     CGSize s = [self.logLabel sizeThatFits:CGSizeMake(bw - 8, CGFLOAT_MAX)];
     // 底边固定贴着日志框底部：内容多就向上溢出、被 logBox 裁掉最旧的行（永远看得到最新状态）
     self.logLabel.frame = CGRectMake(4, bh - s.height - 4, bw - 8, s.height);
-    sLastTxt = txt; sLastBW = bw; sLastBH = bh;
+    sLastVer = gPool.logVer; sLastBW = bw; sLastBH = bh; sLastValid = YES;
   }
 }
 
@@ -2270,15 +2301,22 @@ static void ahaRefreshNow(void) {
 }
 - (void)ahaResize:(UIPanGestureRecognizer *)g {
   static CGFloat w0, h0;
-  if (g.state == UIGestureRecognizerStateBegan) { w0 = self.frame.size.width; h0 = self.frame.size.height; }
+  if (g.state == UIGestureRecognizerStateBegan) {
+    w0 = self.frame.size.width; h0 = self.frame.size.height;
+    gPanelDragging = YES;   // v0.5.44 缩放复用拖拽的丝滑机制：进行中跳过日志重排版
+  }                          //（旧版缩放每帧 layoutPanel+日志 sizeThatFits 叠在手指帧上 = 卡手）
   if (g.state == UIGestureRecognizerStateChanged) {
     CGPoint t = [g translationInView:self];
     CGFloat scrW = [UIScreen mainScreen].bounds.size.width;
     CGFloat scrH = [UIScreen mainScreen].bounds.size.height;
     CGFloat w = MIN(MAX(w0 + t.x, 240), scrW - 20);   // v0.5.43 下限 280→240，可拖更窄
-    CGFloat h = MIN(MAX(h0 + t.y, 330), scrH - 40);
+    CGFloat h = MIN(MAX(h0 + t.y, 420), scrH - 40);   // v0.5.44 下限 330→420：保住日志区高度
     self.frame = CGRectMake(self.frame.origin.x, self.frame.origin.y, w, h);
     if (gUI) [gUI layoutPanel];
+  }
+  if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled) {
+    gPanelDragging = NO;
+    if (gUI) ahaRefreshNow();   // 松手立刻补排版，不用等 250ms 合并窗
   }
   if (g.state == UIGestureRecognizerStateEnded && gPool) {
     gPool.cfg[@"panelW"] = @(self.frame.size.width);
