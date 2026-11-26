@@ -182,7 +182,9 @@ static void ahaStep(NSString *tag);                       // v0.5.34 前置声�
 - (void)inspectJSON:(NSDictionary *)obj;                  // Ajie 同款：NSJSONSerialization 钩子喂进来的对象
 - (void)inspectRawBody:(NSString *)body url:(NSString *)u request:(NSURLRequest *)req;
 - (NSString *)bodyForShop:(NSString *)shop item:(NSString *)item;
+- (NSDictionary *)bodyInfoForShop:(NSString *)shop item:(NSString *)item;   // v0.5.49 body+来源URL
 - (void)storeBody:(NSString *)body shop:(NSString *)shop item:(NSString *)item;
+- (void)storeBody:(NSString *)body shop:(NSString *)shop item:(NSString *)item url:(NSString *)url;   // v0.5.49
 - (NSDictionary *)contextCopy;
 @end
 
@@ -291,13 +293,19 @@ static void ahaStep(NSString *tag);                       // v0.5.34 前置声�
     }
   }
   if (shop.length && item.length && ![shop isEqualToString:@"(null)"] && ![item isEqualToString:@"(null)"])
-    [self storeBody:body shop:shop item:item];
+    [self storeBody:body shop:shop item:item url:req.URL.absoluteString];   // v0.5.49 completionHandler 通道带来源 URL
 }
 
 - (void)storeBody:(NSString *)body shop:(NSString *)shop item:(NSString *)item {
+  [self storeBody:body shop:shop item:item url:nil];
+}
+
+// v0.5.49：包体连同「产出它的真实 URL」一起存（Ajie submitCapturedJSONString:sourceURL:
+// 0x372a0 实证：提交报文 url/rawResponseUrl = 真实来源 URL，不是构造模板——审核按这个回访比对）
+- (void)storeBody:(NSString *)body shop:(NSString *)shop item:(NSString *)item url:(NSString *)url {
   @synchronized (self) {
     _bodies[[NSString stringWithFormat:@"%@|%@", shop, item]] =
-        @{ @"body": body ?: @"", @"at": [NSDate date] };
+        @{ @"body": body ?: @"", @"at": [NSDate date], @"url": url ?: @"" };
     if (_bodies.count > 40) {           // 只留最近 40 个商品，防内存膨胀
       NSArray *keys = [_bodies keysSortedByValueUsingComparator:
           ^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
@@ -313,6 +321,16 @@ static void ahaStep(NSString *tag);                       // v0.5.34 前置声�
   @synchronized (self) {
     NSDictionary *e = _bodies[[NSString stringWithFormat:@"%@|%@", shop, item]];
     out = e[@"body"];
+  }
+  return out;
+}
+
+// v0.5.49：包体 + 来源 URL 一起取（url 为空 = 该入库点没带 URL，调用方回退 freshPdpURL/模板）
+- (NSDictionary *)bodyInfoForShop:(NSString *)shop item:(NSString *)item {
+  __block NSDictionary *out = nil;
+  @synchronized (self) {
+    NSDictionary *e = _bodies[[NSString stringWithFormat:@"%@|%@", shop, item]];
+    if (e) out = @{ @"body": e[@"body"] ?: @"", @"url": e[@"url"] ?: @"" };
   }
   return out;
 }
@@ -393,7 +411,9 @@ static void ahaBadBodyLog(NSString *body, NSString *shop, NSString *item) {
     dispatch_async(gPool.q, ^{ gPool.risk = NO; });
     dispatch_async(gPool.q, ^{ gPool.risk = NO; gPool.failStreak = 0; });
     if (!ahaPdpBodyValid(body)) { ahaBadBodyLog(body, sid, iid); return; }   // v0.5.31 十字段门
-    [self storeBody:body shop:sid item:iid];
+    // v0.5.49 来源 URL：JSON 门拿不到请求对象，用 rememberPdpURL 记下的 app 真实 pdp URL
+    //（请求先发后解析，此刻必然已在）——Ajie 提交报文的 url/rawResponseUrl 就是这个
+    [self storeBody:body shop:sid item:iid url:[[AHACapture shared] freshPdpURL]];
   } @catch (__unused NSException *e) { /* 非目标 JSON，静默 */ }
 }
 
@@ -438,7 +458,7 @@ static void ahaBadBodyLog(NSString *body, NSString *shop, NSString *item) {
     if (![shop isKindOfClass:[NSString class]] || shop.length == 0 || [shop isEqualToString:@"(null)"]) return;
     dispatch_async(gPool.q, ^{ gPool.risk = NO; gPool.failStreak = 0; });
     if (!ahaPdpBodyValid(body)) { ahaBadBodyLog(body, shop, item); return; }   // v0.5.31 十字段门：query 有参数≠回包合格
-    [self storeBody:body shop:shop item:item];
+    [self storeBody:body shop:shop item:item url:u];   // v0.5.49 RAW 门自带请求 URL
   } @catch (__unused NSException *e) { /* 静默 */ }
 }
 @end
@@ -1864,27 +1884,31 @@ static void ahaLog(NSString *lv, NSString *msg) {
        等 app 自己的 get_pc 回包（0.5s 轮询），5 秒还没到就**并行**点火 Direct PDP 直连，
        谁先回用谁 —— 旧版要傻等满 15 秒才开始直连，页面加载一慢单笔任务烧 15~35 秒（用户报「卡很久」）。
        睡在后台队列，不堵 _q / 主线程。 */
-    __block NSString *capBody = nil, *dirBody = nil;
+    /* v0.5.49 提交对齐 Ajie：url/rawResponseUrl = 产出包体的真实来源 URL（0x372a0 实证），
+       并把「来源通道」上报中枢留证（审核通过率按通道归因）。 */
+    __block NSDictionary *capInfo = nil, *dirInfo = nil;
     __block BOOL directFired = NO;
-    for (int i = 0; i < 30 && !capBody && !dirBody; i++) {
+    for (int i = 0; i < 30 && !capInfo && !dirInfo; i++) {
       [NSThread sleepForTimeInterval:0.5];
-      capBody = [[AHACapture shared] bodyForShop:shopId item:itemId];
+      NSDictionary *ci = [[AHACapture shared] bodyInfoForShop:shopId item:itemId];
+      if (ci[@"body"].length > 100) capInfo = ci;
       if (!directFired && i >= 9) {
         directFired = YES;
         ahaLog(@"i", @"截包偏慢，直连并行兜底");
         ahaStep(@"任务:DirectPDP并行");
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-          NSString *db = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
-          if (db) dirBody = db;
+          NSDictionary *di = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
+          if (di) dirInfo = di;
         });
       }
     }
-    NSString *body = capBody;
+    NSDictionary *info = capInfo;   // 谁先回用谁（截包优先）
     NSString *via = @"app截包";
-    if (!body && directFired) {
-      for (int i = 0; i < 40 && !dirBody; i++) [NSThread sleepForTimeInterval:0.5];
-      if (dirBody) { body = dirBody; via = @"DirectPDP"; }
+    if (!info && directFired) {
+      for (int i = 0; i < 40 && !dirInfo; i++) [NSThread sleepForTimeInterval:0.5];
+      if (dirInfo) { info = dirInfo; via = @"DirectPDP"; }
     }
+    NSString *body = info[@"body"];
     if (!body) {
       // 截包 + 直连双通道都没拿到 = 页面没开/没发 get_pc → 才计连续失败
       //（旧版「截包超时」就计，直连救回来也白计，连续 2 次还误触风控暂停）
@@ -1893,8 +1917,9 @@ static void ahaLog(NSString *lv, NSString *msg) {
       if (!directFired) {
         ahaLog(@"i", @"明细超时，直调兜底");
         ahaStep(@"任务:DirectPDP兜底");
-        body = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
+        info = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
         via = @"DirectPDP";
+        body = info[@"body"];
         if (!body) ahaLog(@"w", @"直连失败，不计入风控");
       } else {
         ahaLog(@"w", @"直连并行也没拿到，任务回池");   // 并行直连已经试过 20s 超时，不再重复发
@@ -1923,7 +1948,11 @@ static void ahaLog(NSString *lv, NSString *msg) {
       ahaRefreshUI();
       ahaStep(@"任务:提交");
       ahaLog(@"i", @"提交中");   // v0.5.30 四状态：抢单成功/进入详情成功/提交中/提交成功
-      [self submit:taskId taskUrl:pcUrl result:body itemId:itemId acct:acct jxServer:jxServer token:subTok];
+      // v0.5.49：真实来源 URL = 包体自带 > app 最近 pdp URL > 构造模板（Ajie url/rawResponseUrl 同款语义）
+      NSString *realUrl = info[@"url"];
+      if (realUrl.length == 0) realUrl = [[AHACapture shared] freshPdpURL];
+      [self submit:taskId taskUrl:pcUrl result:body itemId:itemId acct:acct
+           jxServer:jxServer token:subTok realUrl:realUrl via:via];
     });
   });
 }
@@ -1931,7 +1960,8 @@ static void ahaLog(NSString *lv, NSString *msg) {
 // —— Direct PDP：重放 app 上下文调商品接口（Ajie 的核心兜底）——
 // v0.5.24：优先重放 app 刚发出的真实 pdp/get URL（get_pc 已是老端点，SGW 直接 418）；
 // 90 秒内 app 发过 pdp 请求才有 fresh URL，否则回退 get_pc 模板
-- (NSString *)directFetchShop:(NSString *)shopId item:(NSString *)itemId taskUrl:(NSString *)taskUrl {
+// v0.5.49：返回 @{body,url}（url=本次直连真实使用的 URL，提交报文 url/rawResponseUrl 用它）
+- (NSDictionary *)directFetchShop:(NSString *)shopId item:(NSString *)itemId taskUrl:(NSString *)taskUrl {
   NSString *url = [[AHACapture shared] freshPdpURL];
   if (!url) {
     url = taskUrl;
@@ -1964,10 +1994,10 @@ static void ahaLog(NSString *lv, NSString *msg) {
   }] resume];
   dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(22 * NSEC_PER_SEC)));
   if (out.length > 100) {
-    if (ahaPdpBodyValid(out)) [[AHACapture shared] storeBody:out shop:shopId item:itemId];
-    else { out = nil; }   /* v0.5.31 十字段门；v0.5.37 静默不刷日志 */
+    if (ahaPdpBodyValid(out)) return @{ @"body": out, @"url": url };
+    out = nil;   /* v0.5.31 十字段门；v0.5.37 静默不刷日志 */
   } else out = nil;
-  return out;
+  return nil;
 }
 
 // —— v0.5.32 第二刀：Ajie 设备号同款——稳定 device_id（UserDefaults 持久化），
@@ -1994,15 +2024,18 @@ __attribute__((unused)) static NSString *ahaNewUuid(void) { return [[NSUUID UUID
 // 中枢记账（bump submitted / acctDay / winStats）也在同一处，账本唯一不再有双路径分歧。
 - (void)submit:(NSString *)taskId taskUrl:(NSString *)taskUrl result:(NSString *)result
         itemId:(NSString *)itemId acct:(NSString *)acct
-      jxServer:(NSString *)jxServer token:(NSString *)token {
+      jxServer:(NSString *)jxServer token:(NSString *)token
+        realUrl:(NSString *)realUrl via:(NSString *)via {
   (void)jxServer; (void)token;   // 领单下发字段保留在签名里（调用点不动），提交一律走中枢
-  [self hubSubmit:taskId taskUrl:taskUrl result:result itemId:itemId acct:acct];
+  [self hubSubmit:taskId taskUrl:taskUrl result:result itemId:itemId acct:acct realUrl:realUrl via:via];
 }
 
 - (void)hubSubmit:(NSString *)taskId taskUrl:(NSString *)taskUrl result:(NSString *)result
-           itemId:(NSString *)itemId acct:(NSString *)acct {
+           itemId:(NSString *)itemId acct:(NSString *)acct
+           realUrl:(NSString *)realUrl via:(NSString *)via {
   [self api:@"/api/pool/submit" method:@"POST"
       body:@{ @"taskId": taskId, @"url": taskUrl, @"result": result,
+              @"realUrl": realUrl ?: @"", @"via": via ?: @"",   // v0.5.49 真实来源URL + 通道（中枢对齐 Ajie 报文用）
               @"itemId": itemId ?: @"", @"acct": acct ?: @"",
               @"profileId": self.cfg[@"pid"] ?: @"" }
       done:^(NSDictionary *j, NSError *e) {
