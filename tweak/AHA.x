@@ -1891,7 +1891,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
     for (int i = 0; i < 30 && !capInfo && !dirInfo; i++) {
       [NSThread sleepForTimeInterval:0.5];
       NSDictionary *ci = [[AHACapture shared] bodyInfoForShop:shopId item:itemId];
-      if (ci[@"body"].length > 100) capInfo = ci;
+      if ([(NSString *)ci[@"body"] length] > 100) capInfo = ci;
       if (!directFired && i >= 9) {
         directFired = YES;
         ahaLog(@"i", @"截包偏慢，直连并行兜底");
