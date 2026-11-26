@@ -410,8 +410,7 @@ static void ahaBadBodyLog(NSString *body, NSString *shop, NSString *item) {
       ahaRefreshUI();
       return;
     }
-    dispatch_async(gPool.q, ^{ gPool.risk = NO; });
-    dispatch_async(gPool.q, ^{ gPool.risk = NO; gPool.failStreak = 0; });
+    dispatch_async(gPool.q, ^{ gPool.risk = NO; gPool.failStreak = 0; });   // v0.5.52 合并冗余 dispatch（原两行重复入队）
     if (!ahaPdpBodyValid(body)) { ahaBadBodyLog(body, sid, iid); return; }   // v0.5.31 十字段门
     // v0.5.49 来源 URL：JSON 门拿不到请求对象，用 rememberPdpURL 记下的 app 真实 pdp URL
     //（请求先发后解析，此刻必然已在）——Ajie 提交报文的 url/rawResponseUrl 就是这个
@@ -1379,7 +1378,11 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
 - (NSString *)statusText {
   if (self.risk) return @"● 此账号已风控！";
   if (self.connecting) return @"● 连接中…";
-  if (!self.connected) return @"● 未连接";
+  if (!self.connected) {
+    NSString *u = [self.cfg[@"user"] stringByTrimmingCharactersInSet:
+        [NSCharacterSet whitespaceCharacterSet]];
+    return (u.length == 0) ? @"● 请输入采集账号（⚙设置）" : @"● 未连接";
+  }
   if (!self.running) return [NSString stringWithFormat:@"● 已连接 %@（待机）", self.me ?: @""];
   if (self.resting) return @"● 休息中";
   return [NSString stringWithFormat:@"● 运行中 · %@", self.me ?: @""];
@@ -1447,8 +1450,16 @@ static void ahaLog(NSString *lv, NSString *msg) {
 // —— HTTP（默认会话；pdp 请求顺带被钩子记住上下文，喂给 Direct PDP）——
 - (void)api:(NSString *)path method:(NSString *)method body:(NSDictionary *)body
         done:(void (^)(NSDictionary *, NSError *))done {
-  NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
-      [NSURL URLWithString:[self.base stringByAppendingString:path]]];
+  /* v0.5.52 防御：地址填错（缺 https:// 等）URLWithString 返回 nil，
+     拿 nil request 去 dataTask 会直接 NSInvalidArgumentException 崩给用户。
+     改成把错误回传 done，让调用方走正常失败分支。 */
+  NSURL *url = [NSURL URLWithString:[self.base stringByAppendingString:path ?: @""]];
+  if (!url) {
+    if (done) done(@{}, [NSError errorWithDomain:@"AHA" code:-2
+        userInfo:@{ NSLocalizedDescriptionKey: @"中枢地址无效（检查 https:// 前缀）" }]);
+    return;
+  }
+  NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
   req.HTTPMethod = method ?: @"GET";
   req.timeoutInterval = 30;
   [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
@@ -1474,7 +1485,15 @@ static void ahaLog(NSString *lv, NSString *msg) {
 - (void)connect:(void (^)(void))after {
   NSString *u = [self.cfg[@"user"] stringByTrimmingCharactersInSet:
       [NSCharacterSet whitespaceCharacterSet]];
-  if (u.length == 0) { ahaLog(@"w", @"先填账号"); ahaRefreshUI(); return; }
+  /* v0.5.52 修复「没填账号一直卡在连接中」：startLoop 已把 connecting=YES，
+     这里 early return 必须先复位，否则按钮永远停在「连接中…」 */
+  if (u.length == 0) {
+    self.connecting = NO;
+    self.connected = NO; self.token = nil;
+    ahaLog(@"e", @"请先填写采集账号（点⚙设置）");
+    ahaRefreshNow();
+    return;
+  }
   self.taskLine = @"";
   ahaLog(@"i", [NSString stringWithFormat:@"[%@] 正在登录 %@ …", u, self.base]);
   [self api:@"/api/pool/login" method:@"POST"
@@ -2540,7 +2559,10 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
     f.text = gPool.cfg[@"couponAcct"] ?: @"";
   }];
   [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *act) {
-    NSString *sv = a.textFields[0].text ?: @"";
+    /* v0.5.52 保存前 trim + 去尾部斜杠：粘进来带空格/尾 / 会直接连不上（URL 拼接后路径错误） */
+    NSString *sv = [a.textFields[0].text stringByTrimmingCharactersInSet:
+        [NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+    while ([sv hasSuffix:@"/"]) sv = [sv substringToIndex:sv.length - 1];
     if (sv.length) {
       gPool.cfg[@"server"] = sv;
       ahaLog(@"i", @"服务器已保存");
