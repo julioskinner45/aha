@@ -88,6 +88,9 @@ static AHAUI   *gUI   = nil;
 // v0.5.22 纯净模式开关（aha_pure_v1，默认开）：二分定位「装上即全网死」——
 // 纯净 = 不装任何网络钩子 + 不装崩溃捕获器；完整 = 功能全装。切换后需重启虾皮生效
 static BOOL gPure = YES;
+// v0.5.47 虚拟设备指纹开关（aha_fp_on，默认 NO）：开=在 ctor 装 IDFV/IDFA/追踪钩；关=完全不碰设备身份。
+// 默认关的教训见 %ctor 注释（中途变脸 → 首页白屏整屏点不动）。
+static BOOL gFpOn = NO;
 
 static void ahaLog(NSString *lv, NSString *msg);          // 写日志 + 面板滚动
 // 观察窗：打开商品页后 30s 内记录 app 发出的每条虾皮请求（诊断「页面开了但没回包」）
@@ -497,6 +500,7 @@ static NSString *ahaFakeId(NSString *key) {
 }
 // 登录成功时补种（Ajie 登录双装钩的「种子」半边）
 static void ahaApplyFpAccountSeed(NSString *acct) {
+  if (!gFpOn) return;   // v0.5.47：指纹钩没装就一个字节都不碰（避免留下种子、下次误开时身份突变更惨）
   if (acct.length == 0) return;
   NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
   NSString *prev = [d stringForKey:@"aha_fp_acct"];
@@ -2378,9 +2382,25 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
     [gPool saveCfg];
     if ([gPool.cfg[@"couponAcct"] length]) ahaLog(@"i", @"优惠券检测已开启：领取任务前先检测优惠券数据");
   }]];
+  // v0.5.47 虚拟设备指纹开关（默认关。Ajie 同款能力保留，但必须显式打开+重启才生效）
+  [a addAction:[UIAlertAction actionWithTitle:(gFpOn ? @"虚拟设备指纹：已开（点此关闭）"
+                                                   : @"虚拟设备指纹：已关（点此开启）")
+      style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *act) {
+    BOOL want = !gFpOn;
+    [[NSUserDefaults standardUserDefaults] setBool:want forKey:@"aha_fp_on"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    ahaLog(@"w", want
+        ? @"虚拟指纹已开启：杀掉虾皮进程重开生效（换号防关联用；开启后设备身份会变，首次可能掉登）"
+        : @"虚拟指纹已关闭：杀掉虾皮进程重开生效（默认最稳）");
+  }]];
   // v0.5.45 重置设备指纹（Ajie 面板按钮同款功能；跑单中禁止，防重启打断在途任务）
   [a addAction:[UIAlertAction actionWithTitle:@"重置设备指纹（重启 App）"
       style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *act) {
+    if (!gFpOn) {
+      ahaLog(@"w", @"虚拟指纹未开启（设置里先打开），无需重置");
+      ahaRefreshNow();
+      return;
+    }
     if (gPool.running) {
       ahaLog(@"w", @"跑单中不能重置指纹，先停止采集");
       ahaRefreshNow();
@@ -2694,8 +2714,13 @@ __attribute__((unused)) static void ahaReportLastCrash(void) {
   // 纯净模式开关保留（aha_pure_v1），留作以后二分用
   id pv = [[NSUserDefaults standardUserDefaults] objectForKey:@"aha_pure_v1"];
   gPure = pv ? [pv boolValue] : NO;
-  %init(gFp);   // v0.5.45 设备指纹钩（IDFV/IDFA/追踪开关）——两个模式都装（Ajie ctor 装钩同款）；
-                // 无种子时各钩回退原实现，无行为差异
+  // v0.5.47 血泪教训：虚拟设备指纹默认关闭（aha_fp_on，默认 NO）。
+  // 原因：我们的种子是在「插件登录」时写的，此时 Shopee 已经跑起来、设备身份早已上报绑定，
+  // IDFV 中途变脸 → 服务端设备校验对不上 → 首页数据不下发、RN 卡死白屏、整屏点不动（实机复现）。
+  // Ajie 是在 Shopee 登录那一刻定种子、全程一致，所以它不出这问题。
+  // 改成显式开关（设置⚙里打开，重启 App 生效），默认=不碰设备身份，行为与 v0.5.44 完全一致。
+  gFpOn = [[NSUserDefaults standardUserDefaults] boolForKey:@"aha_fp_on"];
+  if (gFpOn) %init(gFp);   // 只有用户明确打开才装指纹钩
   if (!gPure) {
     %init(gNetCapture);        // completionHandler 双变体（Ajie 0x1423c/0x1425c 1:1）
     %init(gNetJSON);           // NSJSONSerialization 元类钩（Ajie 0x14290 1:1）
