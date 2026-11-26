@@ -1,4 +1,20 @@
-// AHA.x — Shopee app 内采集客户端 v0.5.14（导航 = Ajie 逐字复刻 + 面包屑诊断）
+// AHA.x — Shopee app 内采集客户端（导航 = Ajie 逐字复刻 + 面包屑诊断）
+//
+// v0.5.45（2026-11-26）：设备指纹功能对齐 Ajie 0.1.3-1（数据自派生，机制 1:1）——
+//   ① 每账号虚拟设备指纹：seed=aha:<账号名>（账号变了才重写），假ID=hex(MD5(seed|key))，
+//      %hook UIDevice.identifierForVendor / ASIdentifierManager.advertisingIdentifier →
+//      返回 NSUUID(假ID)，isAdvertisingTrackingEnabled 恒 YES（Ajie 0x45d58 mov w0,#1 实证）；
+//      ctor 装 + 登录成功补种（Ajie ctor+登录双装钩同款）
+//   ② 重置设备指纹（设置⚙里）：新 NSUUID 写种子 + NSUserDefaults 键清扫（小写含
+//      device/did/uuid/dfp/fingerprint/install 一律删，0xbdd4 实证）+ Keychain GenericPassword
+//      同规则清扫（SecItemDelete 在 Ajie 导入表实证）+ 日志 → 2 秒后 exit(0) 重启 App
+//   ③ 解绑登录设备（标题双击触发，Ajie handleTitleDoubleTap 同款）：GET get_user_login_device_list
+//      （合并抓包头 + x-requested-with/x-api-source:rn/Accept）→ data.device_list 过滤 is_current
+//      → 逐台 POST remove_user_login_devices {security_device_id, req_security_dfp(=af-ac-enc-dat),
+//      remove_security_dfp}（0xc2f8 全链实证）
+//   ④ 性能瘦身（App 整体卡主犯削除）：delegate 累积表改按 Class 直接做键（省掉每 chunk 一次
+//      NSStringFromClass 分配）；pdp 上下文快照只在 URL 变化时重拷（旧版每 chunk 全头拷贝）；
+//      日志渲染只排最末 48 行（底部锚定裁掉旧行本来不可见，白白排版 400 行）
 //
 // v0.5.6 关键改动（对照 Ajie 0.1.3 反汇编逐条对齐）：
 // v0.5.13（2026-11-24）：导航/风控/日志/验券 全面对照 Ajie 反汇编 1:1 重做——
@@ -41,12 +57,15 @@
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>   // v0.5.36 CABasicAnimation（风控横幅闪烁）
 #import <Foundation/Foundation.h>
+#import <CommonCrypto/CommonDigest.h>   // v0.5.45 MD5（Ajie CC_MD5 同款）
+#import <Security/Security.h>           // v0.5.45 Keychain 清扫
 #import <objc/message.h>
 #import <signal.h>
 #import <execinfo.h>
 #import <fcntl.h>
 #import <unistd.h>
 #import <stdio.h>
+#import <stdlib.h>   // v0.5.45 exit(0)（重置指纹后 2s 重启，Ajie 同款）
 
 // MSHookMessageEx（substrate）：Ajie delegate 动态 swizzle 同款，不 import substrate.h 直接声明
 extern void MSHookMessageEx(Class _class, SEL message, IMP hook, IMP *result);
@@ -169,6 +188,7 @@ static void ahaStep(NSString *tag);                       // v0.5.34 前置声�
   NSMutableDictionary *_ctx;      // app 自己 pdp 请求头快照
   NSString *_pdpURL;              // v0.5.24：app 真实 pdp 请求 URL
   NSDate *_pdpURLAt;
+  NSString *_ctxURL;              // v0.5.45：上下文快照对应请求 URL（同 URL 不重拷）
 }
 
 + (AHACapture *)shared {
@@ -188,7 +208,12 @@ static void ahaStep(NSString *tag);                       // v0.5.34 前置声�
 - (void)rememberContext:(NSURLRequest *)req {
   NSDictionary *h = req.allHTTPHeaderFields;
   if (!h.count) return;
+  // v0.5.45 性能：同一 URL 的每个回包 chunk 都会进来，全头拷贝每 chunk 一次纯浪费——
+  // URL 没变就跳过（Direct PDP 只需要最新一套头，同请求内头不会中途变）
+  NSString *u = req.URL.absoluteString ?: @"";
   @synchronized (self) {
+    if (u.length && [_ctxURL isEqualToString:u]) return;
+    _ctxURL = [u copy];
     [_ctx removeAllObjects];
     [_ctx addEntriesFromDictionary:h];
   }
@@ -434,6 +459,214 @@ static NSURLSession *AhaSession(NSURLSessionConfiguration *cfg) {
   static AHATrustDelegate *td; static dispatch_once_t once;
   dispatch_once(&once, ^{ td = [[AHATrustDelegate alloc] init]; });
   return [NSURLSession sessionWithConfiguration:cfg delegate:td delegateQueue:nil];
+}
+
+#pragma mark - 每账号虚拟设备指纹（v0.5.45 = Ajie 0.1.3-1 机制 1:1，数据自派生）
+
+// 种子：aha_fp_seed。账号登录成功时写入 aha:<账号名>（账号变了才重写，Ajie applyAccountFingerprintSeed 0xb7cc 同款）；
+// 「重置设备指纹」写随机 NSUUID。空种子/空账号 = 假 ID 拿不到 = 各钩回退原实现（与真机无异）。
+static NSString *ahaFpSeed(void) {
+  return [[NSUserDefaults standardUserDefaults] stringForKey:@"aha_fp_seed"];
+}
+static NSString *ahaHexMD5(NSString *s) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  unsigned char d[CC_MD5_DIGEST_LENGTH];
+  const char *c = s.UTF8String;
+  CC_MD5(c, (CC_LONG)strlen(c), d);
+#pragma clang diagnostic pop
+  NSMutableString *o = [NSMutableString stringWithCapacity:32];
+  for (int i = 0; i < CC_MD5_DIGEST_LENGTH; i++) [o appendFormat:@"%02x", d[i]];
+  return o;   // 32 hex 恰好可被 NSUUID initWithUUIDString 解析（Ajie 0x8638 同款）
+}
+// 假 ID = hex(MD5("<seed>|<key>"))（Ajie 0x8638 逐指令同款，只是前缀自派生）
+static NSString *ahaFakeId(NSString *key) {
+  NSString *seed = ahaFpSeed();
+  if (seed.length == 0) return nil;
+  return ahaHexMD5([NSString stringWithFormat:@"%@|%@", seed, key]);
+}
+// 登录成功时补种（Ajie 登录双装钩的「种子」半边）
+static void ahaApplyFpAccountSeed(NSString *acct) {
+  if (acct.length == 0) return;
+  NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+  NSString *prev = [d stringForKey:@"aha_fp_acct"];
+  if ([prev isEqualToString:acct]) return;   // 账号没变不重写（重置后的随机种子保持有效）
+  [d setObject:acct forKey:@"aha_fp_acct"];
+  [d setObject:[NSString stringWithFormat:@"aha:%@", acct] forKey:@"aha_fp_seed"];
+  [d synchronize];
+}
+
+%group gFp
+// IDFV：有种子 → 假 ID；没有 → 原实现（Ajie replacement 0x45b90 同款 fallback）
+%hook UIDevice
+- (NSUUID *)identifierForVendor {
+  NSString *fake = ahaFakeId(@"idfv");
+  if (fake.length == 32) {
+    NSUUID *u = [[NSUUID alloc] initWithUUIDString:fake];
+    if (u) return u;
+  }
+  return %orig;
+}
+%end
+// IDFA + 追踪开关（Ajie 0x45c74 / 0x45d58：开关恒 YES——mov w0,#1; ret 逐指令实证）
+%hook ASIdentifierManager
+- (NSUUID *)advertisingIdentifier {
+  NSString *fake = ahaFakeId(@"idfa");
+  if (fake.length == 32) {
+    NSUUID *u = [[NSUUID alloc] initWithUUIDString:fake];
+    if (u) return u;
+  }
+  return %orig;
+}
+- (BOOL)isAdvertisingTrackingEnabled {
+  return YES;
+}
+%end
+%end // gFp
+
+#pragma mark - 解绑登录设备 + 重置设备指纹（v0.5.45，Ajie 0xc2f8 / 0xc148 全链实证）
+
+static NSString *const kAhaShopeeAntiBase  = @"https://shopee.tw";
+static NSString *const kAhaDevListPath     = @"/api/v4/anti_fraud/account_security/get_user_login_device_list";
+static NSString *const kAhaDevRemovePath   = @"/api/v4/anti_fraud/account_security/remove_user_login_devices";
+
+// 合并头：抓包的 app 请求头打底 + 三个反欺诈接口固定头（0xc328~0xc3a4 实证：
+// x-requested-with / x-api-source=rn / Accept=application/json，其余骑抓包的
+// Cookie/UA/af-ac-enc-dat 全套 = Ajie mergedShopeeHeadersWithHeaders 同款）
+static NSMutableDictionary *ahaAntiHeaders(void) {
+  NSMutableDictionary *h = [[[AHACapture shared] contextCopy] mutableCopy] ?: [NSMutableDictionary dictionary];
+  h[@"x-requested-with"] = @"XMLHttpRequest";
+  h[@"x-api-source"]     = @"rn";
+  h[@"Accept"]           = @"application/json";
+  return h;
+}
+
+// 逐台解绑（0xcfa8~0xcfd0 实证 body 三键：security_device_id / req_security_dfp(=af-ac-enc-dat 头值) /
+// remove_security_dfp(=同一 id)；POST 带合并头 + Content-Type=application/json）
+static void ahaUnbindRemoveOne(NSURLSession *sess, NSString *devId, NSString *afDat,
+                               NSDictionary *headers, NSInteger idx, NSInteger total) {
+  NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
+      [NSURL URLWithString:[kAhaShopeeAntiBase stringByAppendingString:kAhaDevRemovePath]]];
+  req.HTTPMethod = @"POST";
+  req.timeoutInterval = 20;
+  for (NSString *k in headers) [req setValue:headers[k] forHTTPHeaderField:k];
+  [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+  req.HTTPBody = [NSJSONSerialization dataWithJSONObject:
+      @{ @"security_device_id": devId ?: @"",
+         @"req_security_dfp":   afDat ?: @"",
+         @"remove_security_dfp": devId ?: @"" } options:0 error:nil];
+  [[sess dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+    NSHTTPURLResponse *hr = [r isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)r : nil;
+    ahaLog(e || hr.statusCode != 200 ? @"w" : @"s",
+        [NSString stringWithFormat:@"解绑 %ld/%ld：HTTP %ld%@", (long)idx, (long)total,
+            (long)(hr.statusCode ?: -1), e ? [@" " stringByAppendingString:e.localizedDescription ?: @""] : @""]);
+  }] resume];
+}
+
+// 解绑全部非当前登录设备（Ajie unbindAllLoginDevices 0xc2f8 全链 1:1）：
+// GET 列表 → data.device_list 逐台取 id（security_device_id ?: device_id ?: id，0xcb2c 实证）
+// → is_current ?: current 为真跳过（0xcbc4 实证）→ 逐台 POST remove
+static void ahaUnbindDevices(void) {
+  ahaLog(@"i", @"解绑设备：开始");
+  NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
+      [NSURL URLWithString:[kAhaShopeeAntiBase stringByAppendingString:kAhaDevListPath]]];
+  req.HTTPMethod = @"GET";
+  req.timeoutInterval = 20;
+  NSDictionary *headers = ahaAntiHeaders();
+  for (NSString *k in headers) [req setValue:headers[k] forHTTPHeaderField:k];
+  NSString *afDat = headers[@"af-ac-enc-dat"] ?: @"";
+  [[AhaSession([NSURLSessionConfiguration ephemeralSessionConfiguration])
+      dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+      if (e || !d.length) {
+        ahaLog(@"e", [NSString stringWithFormat:@"解绑设备失败：%@", e.localizedDescription ?: @"空回包"]);
+        return;
+      }
+      id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+      id data = [obj isKindOfClass:[NSDictionary class]] ? obj[@"data"] : nil;
+      NSArray *list = [data isKindOfClass:[NSDictionary class]] ? data[@"device_list"] : nil;
+      if (![list isKindOfClass:[NSArray class]] || list.count == 0) {
+        ahaLog(@"w", @"解绑设备：没有 device_list（可能未登录或风控）");
+        return;
+      }
+      NSMutableArray *ids = [NSMutableArray array];
+      for (NSDictionary *dev in list) {
+        if (![dev isKindOfClass:[NSDictionary class]]) continue;
+        BOOL cur = [dev[@"is_current"] respondsToSelector:@selector(boolValue)] && [dev[@"is_current"] boolValue];
+        if (!cur && [dev[@"current"] respondsToSelector:@selector(boolValue)]) cur = [dev[@"current"] boolValue];
+        if (cur) continue;   // 本机不拆（Ajie 同款）
+        NSString *idv = [NSString stringWithFormat:@"%@", dev[@"security_device_id"] ?: dev[@"device_id"] ?: dev[@"id"] ?: @""];
+        if (idv.length && ![idv isEqualToString:@"(null)"]) [ids addObject:idv];
+      }
+      if (ids.count == 0) { ahaLog(@"i", @"解绑设备：没有其它登录设备"); return; }
+      ahaLog(@"i", [NSString stringWithFormat:@"清理：%lu 台（保留本机）", (unsigned long)ids.count]);
+      NSURLSession *sess = AhaSession([NSURLSessionConfiguration ephemeralSessionConfiguration]);
+      for (NSUInteger i = 0; i < ids.count; i++)
+        ahaUnbindRemoveOne(sess, ids[i], afDat, headers, (NSInteger)i + 1, (NSInteger)ids.count);
+      ahaLog(@"s", @"解绑完成：其它设备已全部下线");
+    });
+  }] resume];
+}
+
+// NSUserDefaults 键清扫（0xbdd4 逐指令同款：全部键小写化，含 device/did/uuid/dfp/fingerprint/install 一律删）
+static void ahaSweepDefaultsForDeviceKeys(void) {
+  NSArray *subs = @[@"device", @"did", @"uuid", @"dfp", @"fingerprint", @"install"];
+  NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+  @try {
+    for (NSString *k in d.dictionaryRepresentation.allKeys) {
+      NSString *low = k.lowercaseString;
+      for (NSString *s in subs) {
+        if ([low containsString:s]) {
+          [d removeObjectForKey:k];
+          break;
+        }
+      }
+    }
+    // 自己的种子/配置不受上面清扫影响（键名不含那些子串），但保险起见重存一次
+    [d synchronize];
+  } @catch (__unused NSException *e) { /* 清扫失败就算了 */ }
+}
+
+// Keychain GenericPassword 清扫（SecItemDelete + kSecClassGenericPassword 在 Ajie 导入表实证；
+// 匹配规则与 NSUserDefaults 同一套子串）
+static void ahaSweepKeychainForDeviceKeys(void) {
+  @try {
+    NSArray *subs = @[@"device", @"did", @"uuid", @"dfp", @"fingerprint", @"install"];
+    NSDictionary *q = @{ (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+                         (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
+                         (__bridge id)kSecReturnAttributes: @YES };
+    CFTypeRef res = NULL;
+    if (SecItemCopyMatching((__bridge CFDictionaryRef)q, &res) != errSecSuccess || !res) return;
+    NSArray *items = CFBridgingRelease(res);
+    for (NSDictionary *it in items) {
+      if (![it isKindOfClass:[NSDictionary class]]) continue;
+      NSString *svc  = it[(__bridge id)kSecAttrService]  ?: @"";
+      NSString *acct = it[(__bridge id)kSecAttrAccount]  ?: @"";
+      NSString *low  = [[svc stringByAppendingString:@"|"] stringByAppendingString:acct].lowercaseString;
+      BOOL hit = NO;
+      for (NSString *s in subs) if ([low containsString:s]) { hit = YES; break; }
+      if (!hit) continue;
+      NSDictionary *del = @{ (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+                             (__bridge id)kSecAttrService: svc,
+                             (__bridge id)kSecAttrAccount: acct };
+      SecItemDelete((__bridge CFDictionaryRef)del);
+    }
+  } @catch (__unused NSException *e) { /* 清扫失败就算了 */ }
+}
+
+// 重置设备指纹（Ajie resetDeviceFingerprint 0xc148 时序 1:1）：
+// 新 NSUUID 写种子（0xbce0）→ NSUserDefaults + Keychain 清扫（0xbdd4）→ 日志 → 2 秒后 exit(0)
+static void ahaFpReset(void) {
+  NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+  NSString *newSeed = [[NSUUID UUID] UUIDString];
+  [d setObject:newSeed forKey:@"aha_fp_seed"];
+  [d removeObjectForKey:@"aha_fp_acct"];   // 下次登录任意账号都保留随机种子（账号没变也不回写账号种子）
+  ahaSweepDefaultsForDeviceKeys();
+  ahaSweepKeychainForDeviceKeys();
+  ahaLog(@"w", [NSString stringWithFormat:@"设备指纹已重置 → %@，2 秒后重启 App", [newSeed substringToIndex:8]]);
+  ahaRefreshNow();
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+      dispatch_get_main_queue(), ^{ exit(0); });
 }
 
 #pragma mark - App 内路由导航（v0.5.6 = Ajie 反汇编逐字复刻，绝不跳出 app）
@@ -800,8 +1033,10 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
 //   5) 累积字节优先 piggyback 在 request-like 对象上（Ajie 用 keyed subscript），
 //      URLSession task 挂不上就用 gTaskBuf 表兜底。
 
-static NSMutableDictionary *gOrigDataDict = nil;   // 类名 → orig(didReceiveData 系)
-static NSMutableDictionary *gOrigDoneDict = nil;   // 类名 → orig(didComplete 系)
+// v0.5.45 性能：字典直接用 Class 对象做键——旧版每 chunk 先 NSStringFromClass（一次字符串分配）
+// 再查表，图片/视频 CDN 的高频 chunk 上这笔纯开销每秒成百上千次
+static NSMutableDictionary *gOrigDataDict = nil;   // Class → orig(didReceiveData 系)
+static NSMutableDictionary *gOrigDoneDict = nil;   // Class → orig(didComplete 系)
 static NSMutableDictionary *gTaskBuf = nil;        // 兜底累积表：task 指针串 → 字节
 static NSString *const kAhaBufKey = @"aha_buf_v1"; // piggyback 键
 
@@ -809,10 +1044,8 @@ static IMP ahaOrigFor(NSMutableDictionary *dict, id obj) {
   if (!dict || !obj) return NULL;
   Class cls = object_getClass(obj);
   if (!cls) return NULL;
-  NSString *cn = NSStringFromClass(cls);
-  if (cn.length == 0) return NULL;
   NSValue *v = nil;
-  @synchronized (dict) { v = dict[cn]; }
+  @synchronized (dict) { v = dict[cls]; }
   return v ? (IMP)v.pointerValue : NULL;
 }
 
@@ -827,11 +1060,9 @@ static void ahaSwizzleDelegate(id delegate) {
     if (!gOrigDataDict) gOrigDataDict = [NSMutableDictionary dictionary];
     if (!gOrigDoneDict) gOrigDoneDict = [NSMutableDictionary dictionary];
     if (!gTaskBuf)      gTaskBuf      = [NSMutableDictionary dictionary];
-    NSString *cn = NSStringFromClass(cls);
-    if (cn.length == 0) return;
     BOOL already = NO;
-    @synchronized (gOrigDataDict) { already = (gOrigDataDict[cn] != nil); }
-    @synchronized (gOrigDoneDict) { already = already || (gOrigDoneDict[cn] != nil); }
+    @synchronized (gOrigDataDict) { already = (gOrigDataDict[cls] != nil); }
+    @synchronized (gOrigDoneDict) { already = already || (gOrigDoneDict[cls] != nil); }
     if (already) return;
 
     // v0.5.23 恢复挂钩（v0.5.21 曾全停）：Ajie 同款做法实证无罪——
@@ -847,11 +1078,11 @@ static void ahaSwizzleDelegate(id delegate) {
     IMP origData = NULL, origDone = NULL;
     if ([delegate respondsToSelector:selData]) {
       MSHookMessageEx(cls, selData, (IMP)ahaDelegateDidReceiveData, &origData);
-      if (origData) @synchronized (gOrigDataDict) { gOrigDataDict[cn] = [NSValue valueWithPointer:origData]; }
+      if (origData) @synchronized (gOrigDataDict) { gOrigDataDict[cls] = [NSValue valueWithPointer:origData]; }
     }
     if ([delegate respondsToSelector:selDone]) {
       MSHookMessageEx(cls, selDone, (IMP)ahaDelegateDidComplete, &origDone);
-      if (origDone) @synchronized (gOrigDoneDict) { gOrigDoneDict[cn] = [NSValue valueWithPointer:origDone]; }
+      if (origDone) @synchronized (gOrigDoneDict) { gOrigDoneDict[cls] = [NSValue valueWithPointer:origDone]; }
     }
 
     // v0.5.28 精简：装钩登记不再刷日志（cn/way 仅留作登记标记）
@@ -1186,6 +1417,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
         self.token = j[@"token"];
         self.me = u;
         self.connected = YES;
+        ahaApplyFpAccountSeed(u);   // v0.5.45 登录成功补种（Ajie applyAccountFingerprintSeed 同款；账号变了才重写）
         ahaLog(@"s", [NSString stringWithFormat:@"已连接 %@（敞口模式 · 池隔离）", self.me]);
         if (after) after();          // beginRun 内部会立即刷新按钮为「停止采集」
       } else {
@@ -1900,6 +2132,12 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   self.ttl.text = @"⠿ AHA 采集";
   self.ttl.textColor = [UIColor whiteColor];
   self.ttl.font = [UIFont boldSystemFontOfSize:15];
+  self.ttl.userInteractionEnabled = YES;
+  // v0.5.45 标题双击 = 解绑登录设备（Ajie handleTitleDoubleTap 0xc2dc 同款触发方式）
+  UITapGestureRecognizer *ttlDT = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(titleDoubleTap)];
+  ttlDT.numberOfTapsRequired = 2;
+  ttlDT.numberOfTouchesRequired = 1;
+  [self.ttl addGestureRecognizer:ttlDT];
   [hd addSubview:self.ttl];
   self.gearBtn  = AhaBtn(@"⚙", [UIColor clearColor], 16);
   self.miniBtn  = AhaBtn(@"—", [UIColor clearColor], 16);
@@ -2054,6 +2292,12 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   ahaLog(@"s", gPure ? @"AHA 已注入（纯净模式）" : @"AHA 已注入");   // v0.5.36：启动只报这一条（上次崩溃汇报已停用，面包屑仍记在本地，要查随时能翻）
 }
 
+// v0.5.45 标题双击 = 解绑其它登录设备（Ajie handleTitleDoubleTap 同款）
+- (void)titleDoubleTap {
+  if (gPool.running) { ahaLog(@"w", @"跑单中不能解绑设备，先停止采集"); ahaRefreshNow(); return; }
+  ahaUnbindDevices();
+}
+
 - (void)fieldsChanged {
   [self.panel endEditing:YES];      // 保存完把键盘收回去
   gPool.cfg[@"user"] = self.userField.text ?: @"";
@@ -2118,6 +2362,16 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
         [NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
     [gPool saveCfg];
     if ([gPool.cfg[@"couponAcct"] length]) ahaLog(@"i", @"优惠券检测已开启：领取任务前先检测优惠券数据");
+  }]];
+  // v0.5.45 重置设备指纹（Ajie 面板按钮同款功能；跑单中禁止，防重启打断在途任务）
+  [a addAction:[UIAlertAction actionWithTitle:@"重置设备指纹（重启 App）"
+      style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *act) {
+    if (gPool.running) {
+      ahaLog(@"w", @"跑单中不能重置指纹，先停止采集");
+      ahaRefreshNow();
+      return;
+    }
+    ahaFpReset();   // 新种子 + 双清扫 → 2 秒后 exit(0)
   }]];
   // v0.5.22 纯净/完整模式切换（二分定位「装上即全网死」，切换后重启虾皮生效）
   [a addAction:[UIAlertAction actionWithTitle:(gPure ? @"切换到完整模式" : @"切换到纯净模式")
@@ -2239,7 +2493,10 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   // 白算一遍，正好叠在手指移动帧上 = 拖起来卡手），松手后下一轮自动补上
   // v0.5.44 渲染缓存从「全文比对」改成「版本号比对」：appendLog 每写一行 logVer++，
   // 拖拽/缩放期间跳过的更新靠版本号必补渲染，杜绝任何边界情况下日志停在旧内容
+  // v0.5.45 渲染只排最末 48 行：底部锚定裁掉的旧行本来不可见，400 行全文 sizeThatFits
+  // 每次刷新纯白算（高频日志时主线程可感）。视觉完全一致：永远只见最新几十行
   NSArray *lines = gPool.logLines;
+  if (lines.count > 48) lines = [lines subarrayWithRange:NSMakeRange(lines.count - 48, 48)];
   NSString *txt = [lines componentsJoinedByString:@"\n"];
   CGFloat bw = self.logBox.bounds.size.width, bh = self.logBox.bounds.size.height;
   static NSUInteger sLastVer = 0; static BOOL sLastValid = NO;
@@ -2422,6 +2679,8 @@ __attribute__((unused)) static void ahaReportLastCrash(void) {
   // 纯净模式开关保留（aha_pure_v1），留作以后二分用
   id pv = [[NSUserDefaults standardUserDefaults] objectForKey:@"aha_pure_v1"];
   gPure = pv ? [pv boolValue] : NO;
+  %init(gFp);   // v0.5.45 设备指纹钩（IDFV/IDFA/追踪开关）——两个模式都装（Ajie ctor 装钩同款）；
+                // 无种子时各钩回退原实现，无行为差异
   if (!gPure) {
     %init(gNetCapture);        // completionHandler 双变体（Ajie 0x1423c/0x1425c 1:1）
     %init(gNetJSON);           // NSJSONSerialization 元类钩（Ajie 0x14290 1:1）
