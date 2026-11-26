@@ -76,6 +76,8 @@ static NSString *const kPdpMark   = @"/api/v4/pdp/";
 static NSString *const kGetPcMark = @"/api/v4/pdp/get_pc";
 // get_pc 直取模板（Ajie 同款：display_model_id=0 / model_selection_logic=3 / tz 480）
 static NSString *const kGetPcTpl  = @"https://shopee.tw/api/v4/pdp/get_pc?display_model_id=0&item_id=%@&model_selection_logic=3&shop_id=%@&tz_offset_in_minutes=480&detail_level=0";
+// v0.5.50：Ajie 0x2729c 候选表第二条模板（get_pc 失效时的老端点兜底）
+static NSString *const kGetTpl    = @"https://shopee.tw/api/v4/pdp/get?itemid=%@&shopid=%@&tz_offset_in_minutes=480";
 
 @class AHAPool;
 @class AHACapture;
@@ -1961,42 +1963,147 @@ static void ahaLog(NSString *lv, NSString *msg) {
 // v0.5.24：优先重放 app 刚发出的真实 pdp/get URL（get_pc 已是老端点，SGW 直接 418）；
 // 90 秒内 app 发过 pdp 请求才有 fresh URL，否则回退 get_pc 模板
 // v0.5.49：返回 @{body,url}（url=本次直连真实使用的 URL，提交报文 url/rawResponseUrl 用它）
-- (NSDictionary *)directFetchShop:(NSString *)shopId item:(NSString *)itemId taskUrl:(NSString *)taskUrl {
-  NSString *url = [[AHACapture shared] freshPdpURL];
-  if (!url) {
-    url = taskUrl;
-    if ([url rangeOfString:kGetPcMark].location == NSNotFound)
-      url = [NSString stringWithFormat:kGetPcTpl, itemId, shopId];
+// v0.5.50 = Ajie 0x2729c/0x27790/0x2ed9c 三处对齐：
+//   ①候选表按 Ajie 顺序（app 真实 URL → 任务 URL → get_pc 模板 → get 模板），只收含 /api/v4/pdp/ 的
+//   ②每个候选先改写 query 的 item_id/itemid/itemids 与 shop_id/shopid 为「当前任务」的值——
+//     不改写时请求打的是上一个商品，回包 item 不符 → 十字段门/归属校验过不去，本次直连白跑
+//   ③逐个候选尝试，2xx 才算拿到；遇验证墙立即停（不再打后续候选，避免风控升级）
+// v0.5.50 = Ajie 0x30a44 同款：回包 item/shop 必须与当前任务一致（防跨商品串包）
+static BOOL ahaPdpBodyOwned(NSString *body, NSString *itemId, NSString *shopId) {
+  if (itemId.length == 0) return YES;
+  NSData *d = [body dataUsingEncoding:NSUTF8StringEncoding];
+  id o = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+  if (![o isKindOfClass:[NSDictionary class]]) return NO;
+  id data = o[@"data"];
+  if (![data isKindOfClass:[NSDictionary class]]) return NO;
+  id it = data[@"item"];
+  if (![it isKindOfClass:[NSDictionary class]]) {
+    id idd = data[@"item_data"];
+    it = [idd isKindOfClass:[NSDictionary class]] ? idd[@"item"] : nil;
   }
-  NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
+  if (![it isKindOfClass:[NSDictionary class]]) return NO;
+  NSString *iid = [NSString stringWithFormat:@"%@", it[@"item_id"] ?: it[@"itemid"] ?: @""];
+  NSString *sid = [NSString stringWithFormat:@"%@", it[@"shop_id"] ?: it[@"shopid"] ?: @""];
+  if (![iid isEqualToString:itemId]) return NO;
+  if (shopId.length && sid.length && ![sid isEqualToString:shopId]) return NO;
+  return YES;
+}
+
+static NSString *ahaRewritePdpURL(NSString *url, NSString *itemId, NSString *shopId) {
+  if (url.length == 0) return url;
+  NSURLComponents *c = [NSURLComponents componentsWithString:url];
+  if (!c) return url;
+  NSMutableArray<NSURLQueryItem *> *qs = [NSMutableArray array];
+  BOOL hasItem = NO, hasShop = NO;
+  for (NSURLQueryItem *q in (c.queryItems ?: @[])) {
+    NSString *n = q.name.lowercaseString ?: @"";
+    NSString *v = q.value;
+    if ([n isEqualToString:@"item_id"] || [n isEqualToString:@"itemid"] || [n isEqualToString:@"itemids"]) {
+      if (itemId.length) v = itemId;
+      hasItem = YES;
+    } else if ([n isEqualToString:@"shop_id"] || [n isEqualToString:@"shopid"]) {
+      if (shopId.length) v = shopId;
+      hasShop = YES;
+    }
+    [qs addObject:[NSURLQueryItem queryItemWithName:q.name value:v]];
+  }
+  if (!hasItem && itemId.length) [qs addObject:[NSURLQueryItem queryItemWithName:@"item_id" value:itemId]];
+  if (!hasShop && shopId.length) [qs addObject:[NSURLQueryItem queryItemWithName:@"shop_id" value:shopId]];
+  c.queryItems = qs;
+  return c.URL.absoluteString ?: url;
+}
+
+static NSArray<NSString *> *ahaPdpCandidates(NSString *taskUrl, NSString *itemId, NSString *shopId) {
+  NSMutableArray *raw = [NSMutableArray array];
+  NSArray *seed = @[ [[AHACapture shared] freshPdpURL] ?: @"",
+                     taskUrl ?: @"",
+                     [NSString stringWithFormat:kGetPcTpl, itemId, shopId],
+                     [NSString stringWithFormat:kGetTpl, itemId, shopId] ];
+  for (NSString *u in seed) {
+    if (u.length == 0) continue;
+    if ([u rangeOfString:kPdpMark].location == NSNotFound) continue;   // Ajie addDirectPDPURLCandidate 同款过滤
+    if ([raw containsObject:u]) continue;                              // 去重
+    [raw addObject:u];
+  }
+  NSMutableArray *out = [NSMutableArray arrayWithCapacity:raw.count];
+  for (NSString *u in raw) [out addObject:ahaRewritePdpURL(u, itemId, shopId)];
+  return out;
+}
+
+// v0.5.50 = Ajie applyShopeeContextToRequest(0x27e14) 黑名单：这些头永不转发
+//（Hop-by-hop / 传输层头交给 NSURLSession，原样带上只会让网关起疑或冲突）
+static BOOL ahaHeaderBlocked(NSString *k) {
+  static NSSet *exact; static NSArray *prefix; static dispatch_once_t o;
+  dispatch_once(&o, ^{
+    exact = [NSSet setWithArray:@[ @"host", @"content-length", @"connection", @"proxy-connection",
+        @"upgrade", @"te", @"trailer", @"transfer-encoding", @"accept-encoding",
+        @"if-none-match", @"if-modified-since", @"if-range", @"range" ]];
+    prefix = @[ @"proxy-" ];
+  });
+  NSString *low = k.lowercaseString ?: @"";
+  if ([exact containsObject:low]) return YES;
+  for (NSString *p in prefix) if ([low hasPrefix:p]) return YES;
+  return NO;
+}
+
+// 单次直连；verify 置 YES = 撞验证墙（调用方停止后续候选）
+static NSString *ahaDirectOnce(NSString *url, NSDictionary *ctx, NSTimeInterval sec, BOOL *verify) {
+  NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]
+                                                    cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                timeoutInterval:sec];
   req.HTTPMethod = @"GET";
-  req.timeoutInterval = 20;
-  NSDictionary *ctx = [[AHACapture shared] contextCopy];
-  if (!ctx.count) return nil;
+  req.HTTPShouldHandleCookies = YES;   // Ajie 0x2f1bc 同款
   for (NSString *k in ctx) {
-    if ([k caseInsensitiveCompare:@"Content-Length"] == NSOrderedSame) continue;
+    if (ahaHeaderBlocked(k)) continue;
     [req setValue:ctx[k] forHTTPHeaderField:k];
   }
   __block NSString *out = nil;
+  __block BOOL wall = NO;
   dispatch_semaphore_t sem = dispatch_semaphore_create(0);
   [[AhaSharedSession()
    dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+    NSHTTPURLResponse *hr = [r isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)r : nil;
     if (!e && d) {
-      NSHTTPURLResponse *hr = [r isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)r : nil;
-      if (hr.statusCode == 200)
+      if (hr.statusCode >= 200 && hr.statusCode < 300)
         out = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
       else
         ahaLog(@"w", [NSString stringWithFormat:@"直调失败 HTTP %ld", (long)hr.statusCode]);
     } else if (e) {
       ahaLog(@"w", [NSString stringWithFormat:@"直调网络错误：%@", e.localizedDescription]);
     }
+    if (out.length) {
+      NSString *low = out.lowercaseString;
+      if ([out rangeOfString:@"90309999"].location != NSNotFound ||
+          [low rangeOfString:@"verify"].location != NSNotFound ||
+          [low rangeOfString:@"captcha"].location != NSNotFound) {
+        wall = YES; out = nil;
+        ahaLog(@"w", @"直连回包=验证墙，停止重试");
+      } else if ([out rangeOfString:@"266900002"].location != NSNotFound) {
+        out = nil;   // Ajie：无数据，换下一个候选
+      }
+    }
     dispatch_semaphore_signal(sem);
   }] resume];
-  dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(22 * NSEC_PER_SEC)));
-  if (out.length > 100) {
-    if (ahaPdpBodyValid(out)) return @{ @"body": out, @"url": url };
-    out = nil;   /* v0.5.31 十字段门；v0.5.37 静默不刷日志 */
-  } else out = nil;
+  dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)((sec + 2) * NSEC_PER_SEC)));
+  if (verify) *verify = wall;
+  return out;
+}
+
+- (NSDictionary *)directFetchShop:(NSString *)shopId item:(NSString *)itemId taskUrl:(NSString *)taskUrl {
+  NSDictionary *ctx = [[AHACapture shared] contextCopy];
+  if (!ctx.count) return nil;
+  NSArray *cands = ahaPdpCandidates(taskUrl, itemId ?: @"", shopId ?: @"");
+  // 总预算 22s 封顶（多候选串行不能把「进详情」拖成分钟级；Ajie 单次 15s，这里同量级）
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:22];
+  for (NSString *url in cands) {
+    NSTimeInterval left = [deadline timeIntervalSinceNow];
+    if (left < 2) break;
+    BOOL wall = NO;
+    NSString *out = ahaDirectOnce(url, ctx, MIN(15.0, left), &wall);
+    if (out.length > 100 && ahaPdpBodyOwned(out, itemId, shopId) && ahaPdpBodyValid(out))
+      return @{ @"body": out, @"url": url };
+    if (wall) break;
+  }
   return nil;
 }
 
