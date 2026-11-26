@@ -105,6 +105,7 @@ static NSInteger gObsAny = 0;      // v0.5.18：窗口内全部请求（不限�
 static NSInteger gObsShopee = 0;   // 窗口内虾皮域名请求
 static NSInteger gObsJSON = 0;     // 窗口内 NSJSON 解析次数
 static NSInteger gObsRecv = 0;     // v0.5.19：窗口内回包事件（completionHandler + delegate）
+static NSInteger gObsPdp = 0;      // v0.5.52：窗口内 pdp 端点请求数（超时诊断：页面到底发没发）
 static void ahaObserveRecv(void) {
   if (gObserveUntil && [gObserveUntil compare:[NSDate date]] == NSOrderedAscending) gObsRecv++;
 }
@@ -118,7 +119,7 @@ static void ahaObserveFlush(void) {
 }
 static void ahaObserveBegin(void) {
   gObserveUntil = [NSDate dateWithTimeIntervalSinceNow:30];
-  gObsCount = 0; gObsAny = 0; gObsShopee = 0; gObsJSON = 0; gObsRecv = 0; gObsFlushed = NO;
+  gObsCount = 0; gObsAny = 0; gObsShopee = 0; gObsJSON = 0; gObsRecv = 0; gObsPdp = 0; gObsFlushed = NO;
   if (!gObsURLs) gObsURLs = [NSMutableArray array]; else [gObsURLs removeAllObjects];
 }
 static void ahaObserveURL(NSString *u) {
@@ -133,6 +134,7 @@ static void ahaObserveURL(NSString *u) {
   NSString *host = uu.host ?: @"";
   if (![host containsString:@"shopee"]) return;
   gObsShopee++;
+  if ([u rangeOfString:kPdpMark].location != NSNotFound) gObsPdp++;   // v0.5.52 pdp 请求计数
   gObsCount++;
   NSString *path = [NSString stringWithFormat:@"%@%@", host, uu.path ?: @""];
   NSString *q = uu.query ?: @"";
@@ -322,17 +324,25 @@ static void ahaStep(NSString *tag);                       // v0.5.34 前置声�
   __block NSString *out = nil;
   @synchronized (self) {
     NSDictionary *e = _bodies[[NSString stringWithFormat:@"%@|%@", shop, item]];
-    out = e[@"body"];
+    NSDate *at = e[@"at"];
+    if (e && at && -[at timeIntervalSinceNow] < 90) out = e[@"body"];   // v0.5.52 时效门同上
   }
   return out;
 }
 
-// v0.5.49：包体 + 来源 URL 一起取（url 为空 = 该入库点没带 URL，调用方回退 freshPdpURL/模板）
+// v0.5.52 时效门（Ajie 语义对齐）：Ajie 的包只在 waitingForPDP（当前任务等待期）捕获，
+// 天然不会旧；我们的 _bodies 常驻缓存，同商品复发任务会把**几分钟/几小时前的旧包**
+// 当本任务的包提交——页面走缓存不发请求时尤其如此。旧包价格/库存与领单时点不符
+// = 聚星审核拒的直接嫌疑。只认 90 秒内的包（与 freshPdpURL 的 TTL 一致），旧的返回 nil
+// 让等待循环落到直连/回池，绝不用旧包凑数。
 - (NSDictionary *)bodyInfoForShop:(NSString *)shop item:(NSString *)item {
   __block NSDictionary *out = nil;
   @synchronized (self) {
     NSDictionary *e = _bodies[[NSString stringWithFormat:@"%@|%@", shop, item]];
-    if (e) out = @{ @"body": e[@"body"] ?: @"", @"url": e[@"url"] ?: @"" };
+    NSDate *at = e[@"at"];
+    if (e && at && -[at timeIntervalSinceNow] < 90)
+      out = @{ @"body": e[@"body"] ?: @"", @"url": e[@"url"] ?: @"",
+               @"age": @((int)-[at timeIntervalSinceNow]) };
   }
   return out;
 }
@@ -1909,11 +1919,17 @@ static void ahaLog(NSString *lv, NSString *msg) {
        并把「来源通道」上报中枢留证（审核通过率按通道归因）。 */
     __block NSDictionary *capInfo = nil, *dirInfo = nil;
     __block BOOL directFired = NO;
+    /* v0.5.52 对齐 Ajie 时序（0x321d8 看门狗 15s + 0x31560 pdpContextReady 门）：
+       ①总等待 15s 硬顶——旧版失败一单烧 35s（首轮 15s + 直连已死后还空等 20s），
+         Ajie 看门狗就是 15s，到点 finishCurrentTaskAndContinue 直接下一单
+       ②直连点火加 pdpContextReady 门：app 90 秒内没发过 pdp 请求（页面没真开过）就不点火——
+         get_pc/get 模板是死端点（SGW 418），点了纯噪音还留 418 记录（Ajie 同门）
+       ③直连结果只在 15s 窗口内收，超窗弃单（Ajie 同） */
     for (int i = 0; i < 30 && !capInfo && !dirInfo; i++) {
       [NSThread sleepForTimeInterval:0.5];
       NSDictionary *ci = [[AHACapture shared] bodyInfoForShop:shopId item:itemId];
-      if ([(NSString *)ci[@"body"] length] > 100) capInfo = ci;
-      if (!directFired && i >= 9) {
+      if ([(NSString *)ci[@"body"] length] > 100) { capInfo = ci; break; }
+      if (!directFired && i >= 9 && [[AHACapture shared] freshPdpURL].length > 0) {
         directFired = YES;
         ahaLog(@"i", @"截包偏慢，直连并行兜底");
         ahaStep(@"任务:DirectPDP并行");
@@ -1925,25 +1941,34 @@ static void ahaLog(NSString *lv, NSString *msg) {
     }
     NSDictionary *info = capInfo;   // 谁先回用谁（截包优先）
     NSString *via = @"app截包";
-    if (!info && directFired) {
-      for (int i = 0; i < 40 && !dirInfo; i++) [NSThread sleepForTimeInterval:0.5];
-      if (dirInfo) { info = dirInfo; via = @"DirectPDP"; }
-    }
+    if (!info && dirInfo) { info = dirInfo; via = @"DirectPDP"; }
     NSString *body = info[@"body"];
     if (!body) {
       // 截包 + 直连双通道都没拿到 = 页面没开/没发 get_pc → 才计连续失败
       //（旧版「截包超时」就计，直连救回来也白计，连续 2 次还误触风控暂停）
       dispatch_async(self.q, ^{ [self noteCaptureFailure:NO]; });
-      dispatch_async(dispatch_get_main_queue(), ^{ ahaObserveFlush(); });   // v0.5.16：超时点把观察窗收集到的 URL 全部刷出
+      // v0.5.52 超时诊断（观察窗 v0.528 改静默后数据白丢——把关键三数打回来）：
+      // pdp请求=0 且页面在列表 = 导航没真开/白板页；pdp请求>0 = 发了但回包没进门（另查）
+      dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *vc = ahaResolvedTopVC();
+        ahaLog(@"w", [NSString stringWithFormat:
+            @"没等到商品数据（页=%@ pdp请求=%ld 全部请求=%ld）",
+            NSStringFromClass([vc class]), (long)gObsPdp, (long)gObsAny]);
+        ahaObserveFlush();
+      });
       if (!directFired) {
-        ahaLog(@"i", @"明细超时，直调兜底");
-        ahaStep(@"任务:DirectPDP兜底");
-        info = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
-        via = @"DirectPDP";
-        body = info[@"body"];
-        if (!body) ahaLog(@"w", @"直连失败，不计入风控");
+        if ([[AHACapture shared] freshPdpURL].length == 0) {
+          ahaLog(@"w", @"app 无近期 pdp 请求，跳过直连（get_pc/get 模板=SGW 418 死端点）");
+        } else {
+          ahaLog(@"i", @"明细超时，直调兜底");
+          ahaStep(@"任务:DirectPDP兜底");
+          info = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
+          via = @"DirectPDP";
+          body = info[@"body"];
+          if (!body) ahaLog(@"w", @"直连失败，不计入风控");
+        }
       } else {
-        ahaLog(@"w", @"直连并行也没拿到，任务回池");   // 并行直连已经试过 20s 超时，不再重复发
+        ahaLog(@"w", @"直连并行也没拿到，任务回池");
       }
     }
     if (body) dispatch_async(self.q, ^{ self.failStreak = 0; gPool.risk = NO; });
@@ -1972,8 +1997,9 @@ static void ahaLog(NSString *lv, NSString *msg) {
       // v0.5.49：真实来源 URL = 包体自带 > app 最近 pdp URL > 构造模板（Ajie url/rawResponseUrl 同款语义）
       NSString *realUrl = info[@"url"];
       if (realUrl.length == 0) realUrl = [[AHACapture shared] freshPdpURL];
+      NSString *bAge = [NSString stringWithFormat:@"%@", info[@"age"] ?: @""];
       [self submit:taskId taskUrl:pcUrl result:body itemId:itemId acct:acct
-           jxServer:jxServer token:subTok realUrl:realUrl via:via];
+           jxServer:jxServer token:subTok realUrl:realUrl via:via bAge:bAge];
     });
   });
 }
@@ -2151,17 +2177,18 @@ __attribute__((unused)) static NSString *ahaNewUuid(void) { return [[NSUUID UUID
 - (void)submit:(NSString *)taskId taskUrl:(NSString *)taskUrl result:(NSString *)result
         itemId:(NSString *)itemId acct:(NSString *)acct
       jxServer:(NSString *)jxServer token:(NSString *)token
-        realUrl:(NSString *)realUrl via:(NSString *)via {
+        realUrl:(NSString *)realUrl via:(NSString *)via bAge:(NSString *)bAge {
   (void)jxServer; (void)token;   // 领单下发字段保留在签名里（调用点不动），提交一律走中枢
-  [self hubSubmit:taskId taskUrl:taskUrl result:result itemId:itemId acct:acct realUrl:realUrl via:via];
+  [self hubSubmit:taskId taskUrl:taskUrl result:result itemId:itemId acct:acct realUrl:realUrl via:via bAge:bAge];
 }
 
 - (void)hubSubmit:(NSString *)taskId taskUrl:(NSString *)taskUrl result:(NSString *)result
            itemId:(NSString *)itemId acct:(NSString *)acct
-           realUrl:(NSString *)realUrl via:(NSString *)via {
+           realUrl:(NSString *)realUrl via:(NSString *)via bAge:(NSString *)bAge {
   [self api:@"/api/pool/submit" method:@"POST"
       body:@{ @"taskId": taskId, @"url": taskUrl, @"result": result,
               @"realUrl": realUrl ?: @"", @"via": via ?: @"",   // v0.5.49 真实来源URL + 通道（中枢对齐 Ajie 报文用）
+              @"bAge": bAge ?: @"",                             // v0.5.52 包龄秒数（审核通过率按包新鲜度归因用）
               @"itemId": itemId ?: @"", @"acct": acct ?: @"",
               @"profileId": self.cfg[@"pid"] ?: @"" }
       done:^(NSDictionary *j, NSError *e) {
