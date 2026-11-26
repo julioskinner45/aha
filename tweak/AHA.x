@@ -461,6 +461,16 @@ static NSURLSession *AhaSession(NSURLSessionConfiguration *cfg) {
   return [NSURLSession sessionWithConfiguration:cfg delegate:td delegateQueue:nil];
 }
 
+// v0.5.46 长跑卡顿主修①：NSURLSession 在 invalidate 前会自我保活（self-retain），
+// 旧版直连 fetch / 券探测 / 解绑每次新建会话且从不 invalidate —— 每单漏 1~2 个
+// 会话（含连接池与 socket），跑几小时几百个，内存与句柄双涨 = 用户报「跑久了卡」。
+// 改全插件共享一个 ephemeral 会话（配置同旧版，cookie/缓存隔离不破坏）。
+static NSURLSession *AhaSharedSession(void) {
+  static NSURLSession *s; static dispatch_once_t once;
+  dispatch_once(&once, ^{ s = AhaSession([NSURLSessionConfiguration ephemeralSessionConfiguration]); });
+  return s;
+}
+
 #pragma mark - 每账号虚拟设备指纹（v0.5.45 = Ajie 0.1.3-1 机制 1:1，数据自派生）
 
 // 种子：aha_fp_seed。账号登录成功时写入 aha:<账号名>（账号变了才重写，Ajie applyAccountFingerprintSeed 0xb7cc 同款）；
@@ -575,7 +585,7 @@ static void ahaUnbindDevices(void) {
   NSDictionary *headers = ahaAntiHeaders();
   for (NSString *k in headers) [req setValue:headers[k] forHTTPHeaderField:k];
   NSString *afDat = headers[@"af-ac-enc-dat"] ?: @"";
-  [[AhaSession([NSURLSessionConfiguration ephemeralSessionConfiguration])
+  [[AhaSharedSession()
       dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
       if (e || !d.length) {
@@ -600,7 +610,7 @@ static void ahaUnbindDevices(void) {
       }
       if (ids.count == 0) { ahaLog(@"i", @"解绑设备：没有其它登录设备"); return; }
       ahaLog(@"i", [NSString stringWithFormat:@"清理：%lu 台（保留本机）", (unsigned long)ids.count]);
-      NSURLSession *sess = AhaSession([NSURLSessionConfiguration ephemeralSessionConfiguration]);
+      NSURLSession *sess = AhaSharedSession();
       for (NSUInteger i = 0; i < ids.count; i++)
         ahaUnbindRemoveOne(sess, ids[i], afDat, headers, (NSInteger)i + 1, (NSInteger)ids.count);
       ahaLog(@"s", @"解绑完成：其它设备已全部下线");
@@ -672,10 +682,15 @@ static void ahaFpReset(void) {
 #pragma mark - App 内路由导航（v0.5.6 = Ajie 反汇编逐字复刻，绝不跳出 app）
 
 // —— 面包屑：每个关键步骤先把名字写进 NSUserDefaults，闪退后下次启动就能报「死在哪一步」——
+// v0.5.46 长跑卡顿主修②：旧版每次都 synchronize 强制落盘，而面包屑挂在钩子热路径
+//（JSON门/RAW门/导航各步，每个网络回包都触发）= 每回包一次磁盘 I/O，跑久了 I/O 压力拖慢全 app。
+// 改：同 tag 连续跳过 + 去 synchronize（系统定期自动落盘，崩溃诊断价值不变——只丢最后一条的落盘时机）。
 static void ahaStep(NSString *tag) {
   @try {
+    static NSString *last = nil;
+    if (last && [last isEqualToString:tag]) return;
     [[NSUserDefaults standardUserDefaults] setObject:tag forKey:@"aha_step_v1"];
-    [[NSUserDefaults standardUserDefaults] synchronize];
+    last = tag;
   } @catch (__unused NSException *e) { /* 记录失败就算了 */ }
 }
 
@@ -1585,7 +1600,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
       }
       __block NSString *pBody = nil;
       dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-      [[AhaSession([NSURLSessionConfiguration ephemeralSessionConfiguration])
+      [[AhaSharedSession()
         dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *err) {
         NSHTTPURLResponse *hr = [r isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)r : nil;
         if (!err && d && hr.statusCode == 200)
@@ -1902,7 +1917,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
   }
   __block NSString *out = nil;
   dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-  [[AhaSession([NSURLSessionConfiguration ephemeralSessionConfiguration])
+  [[AhaSharedSession()
    dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
     if (!e && d) {
       NSHTTPURLResponse *hr = [r isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)r : nil;
