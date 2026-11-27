@@ -47,7 +47,7 @@ S_ATTR_SOME_INSTRUCTIONS = 0x00000400
 
 DYLIB_NAME = 'AHA.dylib'
 PLIST_NAME = 'AHA.plist'
-PKG_VER = '0.5.54'
+PKG_VER = '0.5.55'
 
 
 def pad8(b):
@@ -241,6 +241,12 @@ def main():
         dylib = open(dylib_path, 'rb').read()
         assert dylib[:4].hex() in ('cafebabe', 'bebafeca', 'cffaedfe', 'feedfacf'), \
             'not a Mach-O: %s' % dylib[:4].hex()
+        # v0.5.55 死校验（Sileo 报 ldid: Unsupported Mach-O type 的根因）：
+        # CI find 捞到过 AHA.dylib.dSYM/Contents/Resources/DWARF/AHA.dylib（filetype=0xa MH_DSYM
+        # 伴随文件），只查 magic 放行了。ftype 必须=0x6 MH_DYLIB，否则拒打包。
+        _magic, _cpu, _sub, _ftype = struct.unpack('<IiiI', dylib[:16])
+        assert _magic == MH_MAGIC_64 and _cpu == CPU_TYPE_ARM64 and _ftype == MH_DYLIB, \
+            'AHA.dylib 不是 arm64 MH_DYLIB：ftype=%s（0x6=DYLIB，0xa=DSYM 伴随文件，find 捞错了）' % hex(_ftype)
         print('[+] real compiled dylib: %s (%d B)' % (dylib_path, len(dylib)))
     else:
         dylib = build_stub()

@@ -48,10 +48,13 @@ jobs:
           export THEOS_PACKAGE_SCHEME=rootless
           make clean || true
           make FINALPACKAGE=1 ARCHS=arm64
-          DYLIB="$(find . -name 'AHA.dylib' -not -path '*packages*' | head -1)"
+          # v0.5.55：dSYM 包里的 DWARF 文件也叫 AHA.dylib（filetype=MH_DSYM），必须排除——
+          # 2026-11-27 find 捞到它打出的包装不上（Sileo ldid: Unsupported Mach-O type）
+          DYLIB="$(find . -name 'AHA.dylib' -not -path '*packages*' -not -path '*.dSYM*' | head -1)"
           test -n "$DYLIB" || { echo "AHA.dylib 没找到"; exit 1; }
           echo "DYLIB_PATH=$(realpath "$DYLIB")" >> "$GITHUB_ENV"
           file "$DYLIB"
+          file "$DYLIB" | grep -q "dynamically linked shared library" || { echo "捞到的不是真 dylib（dSYM 伴随文件?）"; exit 1; }
 
       - name: Pack final .deb
         run: |
