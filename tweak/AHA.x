@@ -943,6 +943,71 @@ static UIViewController *ahaResolvedTopVC(void) {
   return ahaDrillFrom(main.rootViewController);
 }
 
+// —— v0.5.56 页面级「商品已不存在」识别（对齐窗口端 collectNoItemPage v7.84）：
+// 用户令：这类单直接提交错误报文，不点火直连；正常商品没抓到包的直连兜底照常。
+// 文案表 1:1 抄窗口端（含繁简/桌面版「此商品不存在」无「已」字）。
+// RN 文本不在 UILabel.text 里——在 RCTText/RCTParagraphComponentView 的 attributedText；
+// 同时兜 UIAlertController 的 title/message（弹窗式提示）与 accessibilityLabel。
+// 所有私有类读取 @try 包，读不到就跳过，绝不因识别逻辑崩掉采集。
+static BOOL ahaNoItemTextMatch(NSString *s) {
+  if (s.length == 0) return NO;
+  static NSArray *pats = nil;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    pats = @[@"你尋找的商品已不存在", @"你寻找的商品已不存在", @"此商品已不存在", @"商品已不存在",
+             @"此商品不存在", @"商品不存在", @"商品已下架", @"商品已被下架", @"查無此商品",
+             @"查无此商品", @"找不到此商品", @"此商品已刪除", @"商品已刪除", @"商品已被刪除",
+             @"此商品已删除", @"商品已删除", @"商品已被删除", @"此商品已停售", @"商品已停售",
+             @"無法查看此商品", @"无法查看此商品", @"無法瀏覽此商品", @"无法浏览此商品"];
+  });
+  for (NSString *p in pats) if ([s rangeOfString:p].location != NSNotFound) return YES;
+  return NO;
+}
+// 返回命中的文案；outSample 回填页面文本样本（诊断用：没命中时打出来，看页面到底显示了什么）
+static NSString *ahaPageNoItemText(NSString **outSample) {
+  if (outSample) *outSample = nil;
+  UIViewController *top = ahaResolvedTopVC();
+  if (!top) return nil;
+  NSMutableString *sample = [NSMutableString string];
+  // ① 弹窗式（UIAlertController）
+  NSMutableArray *alerts = [NSMutableArray array];
+  if ([top isKindOfClass:[UIAlertController class]]) [alerts addObject:top];
+  if (top.presentedViewController && [top.presentedViewController isKindOfClass:[UIAlertController class]])
+    [alerts addObject:top.presentedViewController];
+  for (UIAlertController *a in alerts) {
+    if (ahaNoItemTextMatch(a.title)) return a.title;
+    if (ahaNoItemTextMatch(a.message)) return a.message;
+    if (a.title.length) [sample appendFormat:@"[弹窗]%@ ", a.title];
+    if (a.message.length) [sample appendFormat:@"[弹窗]%@ ", a.message];
+  }
+  // ② view 树递归（UILabel.text / RN attributedText / accessibilityLabel）
+  NSMutableArray *stack = [NSMutableArray arrayWithObject:top.view];
+  int visited = 0;
+  while (stack.count && visited++ < 600 && sample.length < 400) {
+    UIView *v = stack.lastObject;
+    [stack removeLastObject];
+    @try {
+      NSMutableArray *texts = [NSMutableArray array];
+      if ([v isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)v).text;
+        if (t.length) [texts addObject:t];
+      }
+      if ([v respondsToSelector:NSSelectorFromString(@"attributedText")]) {
+        NSAttributedString *as = [(id)v valueForKey:@"attributedText"];
+        if ([as isKindOfClass:[NSAttributedString class]] && as.string.length) [texts addObject:as.string];
+      }
+      if (v.accessibilityLabel.length) [texts addObject:v.accessibilityLabel];
+      for (NSString *t in texts) {
+        if (ahaNoItemTextMatch(t)) return t;
+        if (sample.length < 400) [sample appendFormat:@"%@ ", t];
+      }
+      for (UIView *sub in v.subviews) [stack addObject:sub];
+    } @catch (__unused NSException *e) { /* 私有类读取失败跳过 */ }
+  }
+  if (outSample) *outSample = sample;
+  return nil;
+}
+
 // —— Ajie routeBackOnce 复刻：manager 级回退（它 dylib 里的 8 个回退选择器，goBack 优先）——
 // Shopee 的页面栈不一定是纯 UINavigationController，manager 级回退才是它原生认的「返回」
 static void ahaRouteBackOnce(void) {
@@ -1994,6 +2059,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
        并把「来源通道」上报中枢留证（审核通过率按通道归因）。 */
     __block NSDictionary *capInfo = nil, *dirInfo = nil;
     __block BOOL directFired = NO;
+    __block NSString *pageNoItemHit = nil, *pageSample = nil;   // v0.5.56 主线程页面扫描结果回传
     /* v0.5.52 对齐 Ajie 时序（0x321d8 看门狗 15s + 0x31560 pdpContextReady 门）：
        ①总等待 15s 硬顶——旧版失败一单烧 35s（首轮 15s + 直连已死后还空等 20s），
          Ajie 看门狗就是 15s，到点 finishCurrentTaskAndContinue 直接下一单
@@ -2008,6 +2074,26 @@ static void ahaLog(NSString *lv, NSString *msg) {
       if (!capInfo) {
         NSDictionary *ni = [[AHACapture shared] takeNoItemForShop:shopId item:itemId];
         if (ni) { capInfo = @{ @"body": ni[@"body"] ?: @"", @"url": ni[@"url"] ?: @"", @"noitem": @YES }; break; }
+      }
+      // v0.5.56 页面级「商品已不存在」识别（用户令：这类单直接提交，不点火直连）：
+      // 导航后 app 没发 pdp 请求、页面直接显示「你尋找的商品已不存在」——扫 UI 文案命中即构造
+      // 标准 error 报文提交（对齐窗口端 v7.121 错误报文原样提交=聚星算有效数据）。
+      // 异步派主线程扫（UI API 必须在主线程），结果 __block 回传、下一轮读；直连门完全不动——
+      // 正常商品没抓到包照常兜底。扫描本身不碰 capInfo，杜绝主线程/等包线程数据竞争。
+      if (!capInfo && !pageNoItemHit) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          NSString *sample = nil;
+          NSString *hit = ahaPageNoItemText(&sample);
+          pageNoItemHit = hit;
+          pageSample = sample;
+        });
+      }
+      if (!capInfo && pageNoItemHit) {
+        NSString *eb = [NSString stringWithFormat:
+            @"{\"error\":266900002,\"data\":null,\"item_id\":%@,\"shop_id\":%@}", itemId, shopId];
+        capInfo = @{ @"body": eb, @"url": pcUrl ?: @"", @"noitem": @YES };
+        ahaLog(@"i", [NSString stringWithFormat:@"页面识别「%@」→ 直接提交错误报文（不点火直连）", pageNoItemHit]);
+        break;
       }
       NSDictionary *ci = [[AHACapture shared] bodyInfoForShop:shopId item:itemId];
       if ([(NSString *)ci[@"body"] length] > 100) { capInfo = ci; break; }
@@ -2037,6 +2123,9 @@ static void ahaLog(NSString *lv, NSString *msg) {
         ahaLog(@"w", [NSString stringWithFormat:
             @"没等到商品数据（页=%@ pdp请求=%ld 全部请求=%ld）",
             NSStringFromClass([vc class]), (long)gObsPdp, (long)gObsAny]);
+        // v0.5.56：页面文案样本（异步扫描回传）——没识别到「商品不存在」但依然超时，
+        // 打出来看页面究竟显示了什么，下一版好补文案表
+        if (pageSample.length) ahaLog(@"w", [NSString stringWithFormat:@"页面文案样本：%@", pageSample]);
         // v0.5.53 死页诊断：窗内见过 error 回包但没能归属/不是 266900002 → 打来源，
         // 一测便知「商品已不存在」页到底打了哪个接口、回的什么错
         NSDictionary *pni = [[AHACapture shared] peekNoItem];
