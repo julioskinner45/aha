@@ -142,6 +142,7 @@ static void ahaStep(NSString *tag);                       // v0.5.34 前置声�
 @property(nonatomic, strong) NSMutableDictionary *cfg;
 @property(nonatomic, strong) NSDate *lastRiskAlert;
 @property(nonatomic, assign) BOOL running, connected, resting, risk;
+@property(nonatomic, assign) NSInteger lastRestTaken;   // v0.5.58 休息死循环修复：上次触发休息时的 taken
 @property(nonatomic, assign) BOOL connecting;   // v0.5.43 点了开始→登录回来之间：按钮亮「连接中」，防重复点
 @property(nonatomic, assign) NSInteger taken, ok, failStreak;   // 连续无数据计数（Ajie consecutivePDPFailures 1:1）
 @property(nonatomic, assign) NSUInteger logVer;   // v0.5.44 日志版本号：渲染跟版本走，不再全文比对
@@ -1490,6 +1491,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
   dispatch_async(self.q, ^{
     if (!self.running) return;
     self.running = NO;
+    self.resting = NO;   // v0.5.58 停止即清休息态（pending 的休息定时器到点 takeOnce 会因 !running 空转返回；lastRestTaken 防重复休息）
     self.connecting = NO;
     self.taskLine = @"已停止（进行中的单会做完）";
     ahaLog(@"w", @"循环已停止");
@@ -1664,11 +1666,16 @@ static void ahaLog(NSString *lv, NSString *msg) {
   dispatch_async(self.q, ^{
     if (!self.running || !self.token) { ahaRefreshUI(); return; }
     // 休息窗口（开关开着 + 每达 restEvery 单歇 restSec 秒）
+    // v0.5.58 死循环修复：原条件 (taken%every)==0 && !resting 在休息结束时 resting 复位 NO →
+    // takeOnce → takeOnceGo → taken%every 仍==0 → 立即再触发休息，无限循环。加 lastRestTaken
+    // 标记：同一 taken 值只休一次，休息结束领了新单（taken 变化）后才开始下一轮计数。
     NSInteger every = [self num:@"restEvery" def:0];
     NSInteger rs = [self num:@"restSec" def:0];
     BOOL restOn = [self.cfg[@"restOn"] boolValue];
-    if (restOn && every > 0 && rs > 0 && self.taken > 0 && (self.taken % every) == 0 && !self.resting) {
+    if (restOn && every > 0 && rs > 0 && self.taken > 0 && (self.taken % every) == 0
+        && !self.resting && self.taken != self.lastRestTaken) {
       self.resting = YES;
+      self.lastRestTaken = self.taken;
       ahaLog(@"w", [NSString stringWithFormat:@"已领 %ld 单，休息 %ld 分钟", (long)self.taken, (long)(rs / 60)]);
       ahaRefreshUI();
       dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(rs * NSEC_PER_SEC)),
@@ -2869,8 +2876,10 @@ __attribute__((unused)) static void ahaReportLastCrash(void) {
   }
   gPool = [AHAPool shared];
   if (!gPure) ahaInstallCrashCatcher();   // v0.5.34：装回崩溃捕获器（诊断进详情闪退，根因下次启动面板直接显示）
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-      dispatch_get_main_queue(), ^{
+  // v0.5.58 面板秒出（用户令，B 方案=Ajie 同款）：ctor 零延迟 async 建窗。原 dispatch_after 3s +
+  // 主队列双重延迟实际 4~6s 才出现；Ajie ctor 反汇编实证 [SHPPluginController sharedInstance start]
+  // 零延迟同步初始化。async 派发天然「主线程忙完才轮到我」，不阻塞启动，面板 ≈1s 内出现。
+  dispatch_async(dispatch_get_main_queue(), ^{
     gUI = [AHAUI shared];
     [gUI boot];
     // v0.5.36：ahaReportLastCrash() 停用——启动日志只显示「AHA 已注入」
