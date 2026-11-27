@@ -99,6 +99,9 @@ static void ahaObserveRecv(void) {
 }
 static NSMutableArray *gObsURLs = nil;
 static BOOL gObsFlushed = NO;
+// v0.5.59 窗口回包记录器（用户令：搞清「你尋找的商品已不存在」页面到底发什么包）：
+// 每个回包记 URL+状态码+长度+报文前200字，miss 上传时一并传中枢存档，事后分析补识别规则
+static NSMutableArray *gMissResp = nil;
 static void ahaObserveFlush(void) {
   if (gObsFlushed) return;
   gObsFlushed = YES;
@@ -109,6 +112,7 @@ static void ahaObserveBegin(void) {
   gObserveUntil = [NSDate dateWithTimeIntervalSinceNow:30];
   gObsCount = 0; gObsAny = 0; gObsShopee = 0; gObsJSON = 0; gObsRecv = 0; gObsPdp = 0; gObsFlushed = NO;
   if (!gObsURLs) gObsURLs = [NSMutableArray array]; else [gObsURLs removeAllObjects];
+  if (!gMissResp) gMissResp = [NSMutableArray array]; else [gMissResp removeAllObjects];   // v0.5.59
 }
 static void ahaObserveURL(NSString *u) {
   if (!gObserveUntil || [gObserveUntil compare:[NSDate date]] == NSOrderedAscending) {
@@ -267,6 +271,16 @@ static NSDictionary *ahaNoItemFromBody(NSString *body, NSString *url) {
   NSHTTPURLResponse *hr = [resp isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)resp : nil;
   NSInteger code = hr.statusCode;
   NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+  // v0.5.59 窗口回包记录器：全端点都记（含 pdp），miss 分析要看「这种页面到底打了什么」
+  if (gMissResp) {
+    @synchronized (gMissResp) {
+      if (gMissResp.count < 25) {
+        NSString *pre = body.length ? body : @"";
+        if (pre.length > 200) pre = [pre substringToIndex:200];
+        [gMissResp addObject:@{ @"u": u ?: @"", @"c": @(code), @"len": @(data.length), @"p": pre }];
+      }
+    }
+  }
   if (!body.length) return;
   // v0.5.53 noitem 扫描：死商品页不打 pdp 接口（诊断实锤 pdp请求=0），错误信号在任意端点回包里——
   // 非 pdp 回包扫完即走，pdp 回包继续走下方原逻辑
@@ -1962,7 +1976,8 @@ static void ahaLog(NSString *lv, NSString *msg) {
                     @"taskUrl": taskUrl ?: @"", @"pid": pid ?: @"", @"acct": acct ?: @"",
                     @"pdp": @(gObsPdp), @"any": @(gObsAny), @"direct": @(directFired),
                     @"topVC": NSStringFromClass([vc class]) ?: @"", @"page": ps,
-                    @"errUrl": pniUrl, @"errBody": pniBody }
+                    @"errUrl": pniUrl, @"errBody": pniBody,
+                    @"resp": (gMissResp ? [gMissResp copy] : @[]) }   // v0.5.59 窗口全部回包（URL+码+长度+前200字）
              done:nil];
         ahaObserveFlush();
       });

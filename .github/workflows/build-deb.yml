@@ -24,7 +24,10 @@ jobs:
 
       - name: System deps
         run: |
-          sudo apt-get update
+          # 2026-11-27 runner 实锤：packages.microsoft.com 403/no longer signed 导致 apt update
+          # 整体失败（与本仓代码无关）。先摘掉 MS 源再 update，失败重试一次。
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/microsoft*.sources || true
+          sudo apt-get update || (sleep 5 && sudo apt-get update)
           sudo apt-get install -y build-essential fakeroot rsync perl libxml2 libtinfo6 xz-utils curl
           curl -sL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64 -o /tmp/ldid
           chmod +x /tmp/ldid && sudo mv /tmp/ldid /usr/local/bin/ldid
