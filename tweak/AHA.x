@@ -795,8 +795,9 @@ static NSString *ahaPageNoItemText(NSString **outSample) {
           if (![v respondsToSelector:NSSelectorFromString(sel)]) continue;
           id o = [v valueForKey:sel];
           if ([o isKindOfClass:[NSAttributedString class]]) {
-            if (o.string.length) [texts addObject:o.string];
-          } else if ([o isKindOfClass:[NSString class]] && o.length) {
+            NSAttributedString *nas = (NSAttributedString *)o;   // v0.5.59 id 上不能直接取属性(CI 编译错)
+            if (nas.string.length) [texts addObject:nas.string];
+          } else if ([o isKindOfClass:[NSString class]] && [(NSString *)o length] > 0) {
             [texts addObject:o];
           }
         }
@@ -1948,6 +1949,21 @@ static void ahaLog(NSString *lv, NSString *msg) {
           ahaLog(@"w", [NSString stringWithFormat:@"窗内 error 回包来源：%@%@（未能归属本单）",
               nu.host ?: @"?", nu.path ?: @""]);
         }
+        // v0.5.59 用户令（Ajie 没有的增强，0x23b80 反汇编实证它对没抓到的单直接丢弃）：
+        // 没抓到的单也把全部证据传中枢存档 miss.jsonl，事后要分析随时拉。
+        // 证据：pdp/全部请求数、页面 topVC、页面文案样本、窗内 error 回包（截 500 字）、直连是否点火过
+        NSString *pniUrl = pni[@"url"] ?: @"";
+        NSString *pniBody = [NSString stringWithFormat:@"%@", pni[@"body"] ?: @""];
+        if (pniBody.length > 500) pniBody = [pniBody substringToIndex:500];
+        NSString *ps = pageSample ?: @"";
+        if (ps.length > 500) ps = [ps substringToIndex:500];
+        [self api:@"/api/pool/miss" method:@"POST"
+            body:@{ @"taskId": taskId, @"itemId": itemId ?: @"", @"shopId": shopId ?: @"",
+                    @"taskUrl": taskUrl ?: @"", @"pid": pid ?: @"", @"acct": acct ?: @"",
+                    @"pdp": @(gObsPdp), @"any": @(gObsAny), @"direct": @(directFired),
+                    @"topVC": NSStringFromClass([vc class]) ?: @"", @"page": ps,
+                    @"errUrl": pniUrl, @"errBody": pniBody }
+             done:nil];
         ahaObserveFlush();
       });
       if (!directFired) {
