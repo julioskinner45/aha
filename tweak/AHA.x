@@ -828,6 +828,60 @@ static NSString *ahaPageNoItemText(NSString **outSample) {
   return nil;
 }
 
+// —— v0.5.61 死商品弹窗主动关掉（用户实证：弹窗一直不下去，挡住后续导航，监控有没有效也看不出来）——
+// 页面识别命中并提交后，主线程再扫一遍窗口找弹窗本体关掉：
+//   ① UIAlertController → dismiss（点 action 可能触发页面跳转，dismiss 最稳）
+//   ② UIControl 按钮 title/accessibility 命中「回到上一步/返回/确定/知道了/好」→ sendActions 点击
+//   ③ 非 UIControl 但可激活的视图（RN 按钮常是 RCTView）→ accessibilityActivate（公开 API，支持就响应）
+// 弹窗能下去 = 页面监控实锤在工作；不下去也无所谓，下一单导航本身会盖过去
+static void ahaDismissNoItemPopup(void) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    @try {
+      UIWindow *own = ahaOwnWin();
+      for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w == own || w.hidden || w.alpha < 0.1f) continue;
+        UIAlertController *alert = nil;
+        UIViewController *vc = w.rootViewController;
+        for (int g = 0; vc && g < 8; g++) {
+          if ([vc isKindOfClass:[UIAlertController class]]) { alert = (UIAlertController *)vc; break; }
+          vc = vc.presentedViewController;
+        }
+        if (alert && alert.actions.count) { [alert dismissViewControllerAnimated:YES completion:nil]; continue; }
+        NSMutableArray *stack = [NSMutableArray array];
+        if (w.rootViewController.view) [stack addObject:w.rootViewController.view];
+        for (UIView *sv in w.subviews) [stack addObject:sv];
+        int visited = 0;
+        while (stack.count && visited < 300) {
+          visited++;
+          UIView *v = stack.lastObject;
+          [stack removeLastObject];
+          NSString *cand = nil;
+          if ([v isKindOfClass:[UIButton class]]) cand = ((UIButton *)v).currentTitle;
+          if (cand.length == 0) cand = v.accessibilityLabel;
+          if (cand.length) {
+            BOOL btnHit = [cand containsString:@"回到上一步"] ||
+                          [cand containsString:@"回上一步"] ||
+                          ([cand containsString:@"返回"] && cand.length < 12) ||
+                          ([cand containsString:@"確定"] && cand.length < 8) ||
+                          ([cand containsString:@"确定"] && cand.length < 8) ||
+                          ([cand containsString:@"知道了"] && cand.length < 8) ||
+                          ([cand isEqualToString:@"好"] || [cand isEqualToString:@"OK"]);
+            if (btnHit) {
+              if ([v isKindOfClass:[UIControl class]]) {
+                [(UIControl *)v sendActionsForControlEvents:UIControlEventTouchUpInside];
+              } else {
+                ((BOOL (*)(id, SEL))objc_msgSend)(v, NSSelectorFromString(@"accessibilityActivate"));
+              }
+              continue;
+            }
+          }
+          for (UIView *sub in v.subviews) [stack addObject:sub];
+        }
+      }
+    } @catch (__unused NSException *e) { /* 静默 */ }
+  });
+}
+
 // —— Ajie routeBackOnce 复刻：manager 级回退（它 dylib 里的 8 个回退选择器，goBack 优先）——
 // Shopee 的页面栈不一定是纯 UINavigationController，manager 级回退才是它原生认的「返回」
 static void ahaRouteBackOnce(void) {
@@ -1937,6 +1991,9 @@ static void ahaLog(NSString *lv, NSString *msg) {
             @"{\"error\":266900002,\"data\":null,\"item_id\":%@,\"shop_id\":%@}", itemId, shopId];
         capInfo = @{ @"body": eb, @"url": pcUrl ?: @"", @"noitem": @YES };
         ahaLog(@"i", [NSString stringWithFormat:@"页面识别「%@」→ 直接提交错误报文（不点火直连）", pageNoItemHit]);
+        // v0.5.61 弹窗主动关掉：识别命中就说明弹窗本体在屏上，点掉/关掉它，
+        // 不挡下一单导航；弹窗下去=页面监控工作的肉眼实锤
+        ahaDismissNoItemPopup();
         break;
       }
       NSDictionary *ci = [[AHACapture shared] bodyInfoForShop:shopId item:itemId];
@@ -1971,9 +2028,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
         ahaLog(@"w", [NSString stringWithFormat:
             @"没等到商品数据（页=%@ pdp请求=%ld 全部请求=%ld）",
             NSStringFromClass([vc class]), (long)gObsPdp, (long)gObsAny]);
-        // v0.5.56：页面文案样本（异步扫描回传）——没识别到「商品不存在」但依然超时，
-        // 打出来看页面究竟显示了什么，下一版好补文案表
-        if (pageSample.length) ahaLog(@"w", [NSString stringWithFormat:@"页面文案样本：%@", pageSample]);
+        // v0.5.61 用户令：面板不再刷「页面文案样本」（样本只进中枢 miss.jsonl 存档，面板保持干净）
         // v0.5.53 死页诊断：窗内见过 error 回包但没能归属/不是 266900002 → 打来源，
         // 一测便知「商品已不存在」页到底打了哪个接口、回的什么错
         NSDictionary *pni = [[AHACapture shared] peekNoItem];
