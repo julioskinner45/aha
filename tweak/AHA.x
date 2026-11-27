@@ -2005,7 +2005,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
       if (i == 0) [[AHACapture shared] clearNoItem];
       if (!capInfo) {
         NSDictionary *ni = [[AHACapture shared] takeNoItemForShop:shopId item:itemId];
-        if (ni) { capInfo = [ni dictionaryWithObject:@YES forKey:@"noitem"]; break; }
+        if (ni) { capInfo = @{ @"body": ni[@"body"] ?: @"", @"url": ni[@"url"] ?: @"", @"noitem": @YES }; break; }
       }
       NSDictionary *ci = [[AHACapture shared] bodyInfoForShop:shopId item:itemId];
       if ([(NSString *)ci[@"body"] length] > 100) { capInfo = ci; break; }
