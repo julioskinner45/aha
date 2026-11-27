@@ -196,18 +196,20 @@ static void ahaStep(NSString *tag);                       // v0.5.34 前置声�
 - (NSDictionary *)contextCopy;
 @end
 
-// —— v0.5.53 noitem 信号提取（项目 A 窗口端 v7.121/v7.134 生产先例，聚星算有效数据=成单）：
-// 聚星任务商品被删/下架时，Shopee 接口回 {"error":266900002,...} 短报文，页面显示「商品已不存在」。
-// 业务规则（用户令）：这类单的错误报文原样提交聚星。只认 error==266900002
-//（90309999 等验证墙绝不提交）；containsString 预筛免 JSON 解析开销。
+// —— v0.5.54 noitem 信号提取（用户令：能提交的都提交；窗口端 v7.121/v7.134 生产先例）：
+// 聚星任务商品被删/下架/无数据时，Shopee 接口回 {"error":...} 短报文，页面显示「商品已不存在」。
+// 业务规则：错误报文原样提交聚星。任何非零 error 都收（v0.5.54 放宽：不只 266900002），
+// 唯独 90309999 验证墙绝不提交（墙下交包=风控升级）；containsString 预筛免 JSON 解析开销。
 static NSDictionary *ahaNoItemFromBody(NSString *body, NSString *url) {
   if (body.length == 0 || body.length > 262144) return nil;
-  if ([body rangeOfString:@"266900002"].location == NSNotFound) return nil;
+  if ([body rangeOfString:@"\"error\""].location == NSNotFound) return nil;
   NSData *d = [body dataUsingEncoding:NSUTF8StringEncoding];
   id o = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
   if (![o isKindOfClass:[NSDictionary class]]) return nil;
   id e = o[@"error"];
-  if (![e respondsToSelector:@selector(integerValue)] || [e integerValue] != 266900002) return nil;
+  if (![e respondsToSelector:@selector(integerValue)]) return nil;
+  NSInteger ec = [e integerValue];
+  if (ec == 0 || ec == 90309999) return nil;   // 0=正常回包；90309999=验证墙
   return @{ @"body": body, @"url": url ?: @"" };
 }
 
@@ -2000,7 +2002,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
        ③直连结果只在 15s 窗口内收，超窗弃单（Ajie 同） */
     for (int i = 0; i < 30 && !capInfo && !dirInfo; i++) {
       [NSThread sleepForTimeInterval:0.5];
-      // v0.5.53 noitem：等包期间收到商品不存在信号（error=266900002）→ 立即提交错误报文，
+      // v0.5.53 noitem：等包期间收到错误回包信号 → 立即提交错误报文，
       // 不等 15s 超时（窗口端 v7.121 同款：立即放行提交，白等十几秒一单纯浪费）
       if (i == 0) [[AHACapture shared] clearNoItem];
       if (!capInfo) {
@@ -2082,7 +2084,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
           taskId, via, (unsigned long)[body lengthOfBytesUsingEncoding:NSUTF8StringEncoding] / 1024];
       ahaRefreshUI();
       ahaStep(@"任务:提交");
-      if (noItem) ahaLog(@"i", @"商品不存在（错误报文原样提交聚星）");   // v0.5.53 窗口端 v7.134 同款口径
+      if (noItem) ahaLog(@"i", @"无有效商品数据（错误报文原样提交聚星）");   // v0.5.54 能提交的都提交
       ahaLog(@"i", @"提交中");   // v0.5.30 四状态：抢单成功/进入详情成功/提交中/提交成功
       // v0.5.49：真实来源 URL = 包体自带 > app 最近 pdp URL > 构造模板（Ajie url/rawResponseUrl 同款语义）
       NSString *realUrl = info[@"url"];
