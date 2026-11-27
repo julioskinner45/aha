@@ -744,45 +744,70 @@ static BOOL ahaNoItemTextMatch(NSString *s) {
   return NO;
 }
 // 返回命中的文案；outSample 回填页面文本样本（诊断用：没命中时打出来，看页面到底显示了什么）
+// v0.5.59 全窗口扫（截图实锤修复：弹窗挂 4 秒没接住，旧版两处致命伤）——
+//   ① 旧版 while 条件带 sample.length<400：死商品页背后是店铺页，页面文字很快填满 400 字
+//      → 整棵树提前停遍历，弹窗排在后面根本没扫到（本次事故根因）
+//   ② 旧版只走 keyWindow top.view：RN/自绘弹窗常直接 addSubview 到独立 UIWindow，
+//      不在任何 VC 的 view 树里。现在扫所有窗口 + window 直挂子视图 + rootVC.view
 static NSString *ahaPageNoItemText(NSString **outSample) {
   if (outSample) *outSample = nil;
-  UIViewController *top = ahaResolvedTopVC();
-  if (!top) return nil;
+  UIWindow *own = ahaOwnWin();
   NSMutableString *sample = [NSMutableString string];
-  // ① 弹窗式（UIAlertController）
-  NSMutableArray *alerts = [NSMutableArray array];
-  if ([top isKindOfClass:[UIAlertController class]]) [alerts addObject:top];
-  if (top.presentedViewController && [top.presentedViewController isKindOfClass:[UIAlertController class]])
-    [alerts addObject:top.presentedViewController];
-  for (UIAlertController *a in alerts) {
-    if (ahaNoItemTextMatch(a.title)) return a.title;
-    if (ahaNoItemTextMatch(a.message)) return a.message;
-    if (a.title.length) [sample appendFormat:@"[弹窗]%@ ", a.title];
-    if (a.message.length) [sample appendFormat:@"[弹窗]%@ ", a.message];
-  }
-  // ② view 树递归（UILabel.text / RN attributedText / accessibilityLabel）
-  NSMutableArray *stack = [NSMutableArray arrayWithObject:top.view];
-  int visited = 0;
-  while (stack.count && visited++ < 600 && sample.length < 400) {
-    UIView *v = stack.lastObject;
-    [stack removeLastObject];
-    @try {
-      NSMutableArray *texts = [NSMutableArray array];
-      if ([v isKindOfClass:[UILabel class]]) {
-        NSString *t = ((UILabel *)v).text;
-        if (t.length) [texts addObject:t];
+  static NSArray *textSels = nil;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    // UILabel.text 之外按选择器兜底读任意文本视图：RN Paper=attributedText(RCTText)，
+    // RN Fabric=RCTParagraphComponentView，Texture/ASDK=attributedString
+    textSels = @[@"attributedText", @"attributedString", @"text"];
+  });
+  int visited = 0;   // 全窗口共享遍历预算（v0.5.59）
+  for (UIWindow *w in [UIApplication sharedApplication].windows) {
+    if (w == own || w.hidden || w.alpha < 0.1f) continue;
+    // ① 该窗口 VC 链上每一层的 UIAlertController title/message
+    UIViewController *vc = w.rootViewController;
+    for (int g = 0; vc && g < 8; g++) {
+      if ([vc isKindOfClass:[UIAlertController class]]) {
+        UIAlertController *a = (UIAlertController *)vc;
+        if (ahaNoItemTextMatch(a.title)) return a.title;
+        if (ahaNoItemTextMatch(a.message)) return a.message;
+        if (a.title.length && sample.length < 400) [sample appendFormat:@"[弹窗]%@ ", a.title];
+        if (a.message.length && sample.length < 400) [sample appendFormat:@"[弹窗]%@ ", a.message];
       }
-      if ([v respondsToSelector:NSSelectorFromString(@"attributedText")]) {
-        NSAttributedString *as = [(id)v valueForKey:@"attributedText"];
-        if ([as isKindOfClass:[NSAttributedString class]] && as.string.length) [texts addObject:as.string];
-      }
-      if (v.accessibilityLabel.length) [texts addObject:v.accessibilityLabel];
-      for (NSString *t in texts) {
-        if (ahaNoItemTextMatch(t)) return t;
-        if (sample.length < 400) [sample appendFormat:@"%@ ", t];
-      }
-      for (UIView *sub in v.subviews) [stack addObject:sub];
-    } @catch (__unused NSException *e) { /* 私有类读取失败跳过 */ }
+      vc = vc.presentedViewController;
+    }
+    // ② window 直挂子视图 + rootVC.view 合并成一棵递归树
+    //    匹配先于收集、遍历只受 view 数预算约束（样本 400 字上限只影响收集不影响继续扫）
+    //    visited 全窗口共享预算 900（弹窗窗口 view 少通常最先扫完，开销与旧版同量级）
+    NSMutableArray *stack = [NSMutableArray array];
+    if (w.rootViewController.view) [stack addObject:w.rootViewController.view];
+    for (UIView *sv in w.subviews) [stack addObject:sv];
+    while (stack.count && visited < 900) {
+      visited++;
+      UIView *v = stack.lastObject;
+      [stack removeLastObject];
+      @try {
+        NSMutableArray *texts = [NSMutableArray array];
+        if ([v isKindOfClass:[UILabel class]]) {
+          NSString *t = ((UILabel *)v).text;
+          if (t.length) [texts addObject:t];
+        }
+        for (NSString *sel in textSels) {
+          if (![v respondsToSelector:NSSelectorFromString(sel)]) continue;
+          id o = [v valueForKey:sel];
+          if ([o isKindOfClass:[NSAttributedString class]]) {
+            if (o.string.length) [texts addObject:o.string];
+          } else if ([o isKindOfClass:[NSString class]] && o.length) {
+            [texts addObject:o];
+          }
+        }
+        if (v.accessibilityLabel.length) [texts addObject:v.accessibilityLabel];
+        for (NSString *t in texts) {
+          if (ahaNoItemTextMatch(t)) return t;
+          if (sample.length < 400 && t.length < 120) [sample appendFormat:@"%@ ", t];
+        }
+        for (UIView *sub in v.subviews) [stack addObject:sub];
+      } @catch (__unused NSException *e) { /* 私有类读取失败跳过 */ }
+    }
   }
   if (outSample) *outSample = sample;
   return nil;
@@ -1882,7 +1907,11 @@ static void ahaLog(NSString *lv, NSString *msg) {
       }
       NSDictionary *ci = [[AHACapture shared] bodyInfoForShop:shopId item:itemId];
       if ([(NSString *)ci[@"body"] length] > 100) { capInfo = ci; break; }
-      if (!directFired && i >= 9 && [[AHACapture shared] freshPdpURL].length > 0) {
+      // v0.5.59 直连门纠偏（用户截图实锤：死商品页还在点火直连）：旧条件 freshPdpURL 是
+      // 跨单 90s 残留——上一单的 pdp URL 还在窗口里门就开了。改用本单 gObsPdp>0
+      // （ahaObserveBegin 每次导航清零）= Ajie pdpContextReady 同款语义：本单 app 真发了
+      // pdp 请求（页面真开）才允许兜底；死商品页 pdp=0 → 绝不点火。正常商品没抓到包照常兜底
+      if (!directFired && i >= 9 && gObsPdp > 0) {
         directFired = YES;
         ahaLog(@"i", @"截包偏慢，直连并行兜底");
         ahaStep(@"任务:DirectPDP并行");
@@ -1922,8 +1951,8 @@ static void ahaLog(NSString *lv, NSString *msg) {
         ahaObserveFlush();
       });
       if (!directFired) {
-        if ([[AHACapture shared] freshPdpURL].length == 0) {
-          ahaLog(@"w", @"app 无近期 pdp 请求，跳过直连（get_pc/get 模板=SGW 418 死端点）");
+        if (gObsPdp == 0) {   // v0.5.59 本单没发过 pdp（页面没真开/商品不存在），不打直连
+          ahaLog(@"w", @"本单无 pdp 请求（页面没真开或商品不存在），跳过直连");
         } else {
           ahaLog(@"i", @"明细超时，直调兜底");
           ahaStep(@"任务:DirectPDP兜底");
