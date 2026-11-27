@@ -187,10 +187,29 @@ static void ahaStep(NSString *tag);                       // v0.5.34 前置声�
 - (void)inspectRawBody:(NSString *)body url:(NSString *)u request:(NSURLRequest *)req;
 - (NSString *)bodyForShop:(NSString *)shop item:(NSString *)item;
 - (NSDictionary *)bodyInfoForShop:(NSString *)shop item:(NSString *)item;   // v0.5.49 body+来源URL
+- (void)noteNoItem:(NSString *)body url:(NSString *)url;    // v0.5.53 noitem 信号（错误报文原样提交用）
+- (void)clearNoItem;                                        // v0.5.53 新任务开始清上一单信号
+- (NSDictionary *)takeNoItemForShop:(NSString *)shop item:(NSString *)item;   // v0.5.53 归属匹配才返回（取走即清）
+- (NSDictionary *)peekNoItem;                               // v0.5.53 诊断：最后一条 error 回包（不管归属）
 - (void)storeBody:(NSString *)body shop:(NSString *)shop item:(NSString *)item;
 - (void)storeBody:(NSString *)body shop:(NSString *)shop item:(NSString *)item url:(NSString *)url;   // v0.5.49
 - (NSDictionary *)contextCopy;
 @end
+
+// —— v0.5.53 noitem 信号提取（项目 A 窗口端 v7.121/v7.134 生产先例，聚星算有效数据=成单）：
+// 聚星任务商品被删/下架时，Shopee 接口回 {"error":266900002,...} 短报文，页面显示「商品已不存在」。
+// 业务规则（用户令）：这类单的错误报文原样提交聚星。只认 error==266900002
+//（90309999 等验证墙绝不提交）；containsString 预筛免 JSON 解析开销。
+static NSDictionary *ahaNoItemFromBody(NSString *body, NSString *url) {
+  if (body.length == 0 || body.length > 262144) return nil;
+  if ([body rangeOfString:@"266900002"].location == NSNotFound) return nil;
+  NSData *d = [body dataUsingEncoding:NSUTF8StringEncoding];
+  id o = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+  if (![o isKindOfClass:[NSDictionary class]]) return nil;
+  id e = o[@"error"];
+  if (![e respondsToSelector:@selector(integerValue)] || [e integerValue] != 266900002) return nil;
+  return @{ @"body": body, @"url": url ?: @"" };
+}
 
 @implementation AHACapture {
   NSMutableDictionary *_bodies;   // @"shop|item" -> @{ body, at }
@@ -198,6 +217,7 @@ static void ahaStep(NSString *tag);                       // v0.5.34 前置声�
   NSString *_pdpURL;              // v0.5.24：app 真实 pdp 请求 URL
   NSDate *_pdpURLAt;
   NSString *_ctxURL;              // v0.5.45：上下文快照对应请求 URL（同 URL 不重拷）
+  NSDictionary *_noItem;          // v0.5.53：noitem 信号 @{ body, url, at }（取走即清）
 }
 
 + (AHACapture *)shared {
@@ -252,11 +272,18 @@ static void ahaStep(NSString *tag);                       // v0.5.34 前置声�
         err.localizedDescription ?: @"未知", (long)err.code]);
     return;
   }
-  if (!data.length || !isPc) return;
+  if (!data.length) return;
   NSHTTPURLResponse *hr = [resp isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)resp : nil;
   NSInteger code = hr.statusCode;
   NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
   if (!body.length) return;
+  // v0.5.53 noitem 扫描：死商品页不打 pdp 接口（诊断实锤 pdp请求=0），错误信号在任意端点回包里——
+  // 非 pdp 回包扫完即走，pdp 回包继续走下方原逻辑
+  if (!isPc) {
+    NSDictionary *ni = ahaNoItemFromBody(body, u);
+    if (ni) [self noteNoItem:ni[@"body"] url:ni[@"url"]];
+    return;
+  }
 
   // —— 风控识别（Ajie 反汇编 1:1：90309999=验证墙自动停；266900002=按正常响应提交；——
   //     403/418 是 SGW 拒直调重放，不算账号风控。v0.5.15：风控判定放 200 之后，
@@ -347,6 +374,48 @@ static void ahaStep(NSString *tag);                       // v0.5.34 前置声�
   return out;
 }
 
+// —— v0.5.53 noitem 信号：任意端点回包 error=266900002 → 存（等包循环 0.5s 轮询消费）——
+// 归属校验在消费端做（URL query 或报文顶层的 item/shop 必须等于当前任务），防其它页面的错误串号
+- (void)noteNoItem:(NSString *)body url:(NSString *)url {
+  if (body.length == 0) return;
+  @synchronized (self) { _noItem = @{ @"body": body, @"url": url ?: @"", @"at": [NSDate date] }; }
+}
+- (void)clearNoItem {
+  @synchronized (self) { _noItem = nil; }
+}
+- (NSDictionary *)peekNoItem {
+  @synchronized (self) { return _noItem; }
+}
+- (NSDictionary *)takeNoItemForShop:(NSString *)shop item:(NSString *)item {
+  @synchronized (self) {
+    NSDictionary *e = _noItem;
+    if (!e) return nil;
+    NSDate *at = e[@"at"];
+    if (!at || -[at timeIntervalSinceNow] > 60) return nil;   // 60s 内有效，防旧信号串号
+    NSString *u = e[@"url"];
+    NSString *iid = nil, *sid = nil;
+    NSURLComponents *uc = u.length ? [NSURLComponents componentsWithString:u] : nil;
+    for (NSURLQueryItem *qi in uc.queryItems ?: @[]) {
+      NSString *n = qi.name.lowercaseString ?: @"";
+      if ([n isEqualToString:@"item_id"] || [n isEqualToString:@"itemid"] || [n isEqualToString:@"itemids"]) iid = qi.value;
+      if ([n isEqualToString:@"shop_id"] || [n isEqualToString:@"shopid"]) sid = qi.value;
+    }
+    if (!iid.length || !sid.length) {   // URL query 无 id → 看报文顶层（网关 POST 类请求）
+      NSData *d = [(NSString *)e[@"body"] dataUsingEncoding:NSUTF8StringEncoding];
+      id o = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+      if ([o isKindOfClass:[NSDictionary class]]) {
+        if (!iid.length) { iid = [NSString stringWithFormat:@"%@", o[@"item_id"] ?: o[@"itemid"] ?: @""]; if ([iid isEqualToString:@"(null)"]) iid = @""; }
+        if (!sid.length) { sid = [NSString stringWithFormat:@"%@", o[@"shop_id"] ?: o[@"shopid"] ?: @""]; if ([sid isEqualToString:@"(null)"]) sid = @""; }
+      }
+    }
+    if (item.length && iid.length && ![iid isEqualToString:item]) return nil;
+    if (shop.length && sid.length && ![sid isEqualToString:shop]) return nil;
+    if (!iid.length && !sid.length) return nil;   // 完全无法归属 → 不提交（peekNoItem 诊断可看）
+    _noItem = nil;   // 取走即清
+    return e;
+  }
+}
+
 // —— Ajie inspectCapturedData 的十字段门（0x37c04 逐指令复刻）：
 // data.item（或 data.item_data.item）里 models/tier_variations/price/price_min/price_max/
 // stock/description/images/item_rating/shop_detailed 至少 8 个非空（汇编 cmp #2 cset hi=最多缺2）。
@@ -434,7 +503,11 @@ static void ahaBadBodyLog(NSString *body, NSString *shop, NSString *item) {
   if (!gPool || body.length == 0) return;
   @try {
     // u 为空 = shp 自家回调通道（拿不到 NSURL），交给下面的形状识别把关
-    if (u.length && [u rangeOfString:kPdpMark].location == NSNotFound) return;   // v0.5.17：任意 /api/v4/pdp/ 端点
+    if (u.length && [u rangeOfString:kPdpMark].location == NSNotFound) {   // v0.5.17：任意 /api/v4/pdp/ 端点
+      NSDictionary *ni = ahaNoItemFromBody(body, u);   // v0.5.53 noitem 扫描（同 inspectData）
+      if (ni) [self noteNoItem:ni[@"body"] url:ni[@"url"]];
+      return;
+    }
     if (req && req.allHTTPHeaderFields.count) [self rememberContext:req];
 
     // 风控识别（Ajie 判据；delegate 通道拿不到 HTTP 码，只看回包内容）
@@ -1927,6 +2000,13 @@ static void ahaLog(NSString *lv, NSString *msg) {
        ③直连结果只在 15s 窗口内收，超窗弃单（Ajie 同） */
     for (int i = 0; i < 30 && !capInfo && !dirInfo; i++) {
       [NSThread sleepForTimeInterval:0.5];
+      // v0.5.53 noitem：等包期间收到商品不存在信号（error=266900002）→ 立即提交错误报文，
+      // 不等 15s 超时（窗口端 v7.121 同款：立即放行提交，白等十几秒一单纯浪费）
+      if (i == 0) [[AHACapture shared] clearNoItem];
+      if (!capInfo) {
+        NSDictionary *ni = [[AHACapture shared] takeNoItemForShop:shopId item:itemId];
+        if (ni) { capInfo = [ni dictionaryWithObject:@YES forKey:@"noitem"]; break; }
+      }
       NSDictionary *ci = [[AHACapture shared] bodyInfoForShop:shopId item:itemId];
       if ([(NSString *)ci[@"body"] length] > 100) { capInfo = ci; break; }
       if (!directFired && i >= 9 && [[AHACapture shared] freshPdpURL].length > 0) {
@@ -1940,7 +2020,8 @@ static void ahaLog(NSString *lv, NSString *msg) {
       }
     }
     NSDictionary *info = capInfo;   // 谁先回用谁（截包优先）
-    NSString *via = @"app截包";
+    BOOL noItem = [[info objectForKey:@"noitem"] boolValue];   // v0.5.53 商品不存在单
+    NSString *via = noItem ? @"noitem" : @"app截包";
     if (!info && dirInfo) { info = dirInfo; via = @"DirectPDP"; }
     NSString *body = info[@"body"];
     if (!body) {
@@ -1954,6 +2035,14 @@ static void ahaLog(NSString *lv, NSString *msg) {
         ahaLog(@"w", [NSString stringWithFormat:
             @"没等到商品数据（页=%@ pdp请求=%ld 全部请求=%ld）",
             NSStringFromClass([vc class]), (long)gObsPdp, (long)gObsAny]);
+        // v0.5.53 死页诊断：窗内见过 error 回包但没能归属/不是 266900002 → 打来源，
+        // 一测便知「商品已不存在」页到底打了哪个接口、回的什么错
+        NSDictionary *pni = [[AHACapture shared] peekNoItem];
+        if (pni) {
+          NSURL *nu = [NSURL URLWithString:pni[@"url"]];
+          ahaLog(@"w", [NSString stringWithFormat:@"窗内 error 回包来源：%@%@（未能归属本单）",
+              nu.host ?: @"?", nu.path ?: @""]);
+        }
         ahaObserveFlush();
       });
       if (!directFired) {
@@ -1993,13 +2082,14 @@ static void ahaLog(NSString *lv, NSString *msg) {
           taskId, via, (unsigned long)[body lengthOfBytesUsingEncoding:NSUTF8StringEncoding] / 1024];
       ahaRefreshUI();
       ahaStep(@"任务:提交");
+      if (noItem) ahaLog(@"i", @"商品不存在（错误报文原样提交聚星）");   // v0.5.53 窗口端 v7.134 同款口径
       ahaLog(@"i", @"提交中");   // v0.5.30 四状态：抢单成功/进入详情成功/提交中/提交成功
       // v0.5.49：真实来源 URL = 包体自带 > app 最近 pdp URL > 构造模板（Ajie url/rawResponseUrl 同款语义）
       NSString *realUrl = info[@"url"];
       if (realUrl.length == 0) realUrl = [[AHACapture shared] freshPdpURL];
       NSString *bAge = [NSString stringWithFormat:@"%@", info[@"age"] ?: @""];
       [self submit:taskId taskUrl:pcUrl result:body itemId:itemId acct:acct
-           jxServer:jxServer token:subTok realUrl:realUrl via:via bAge:bAge];
+           jxServer:jxServer token:subTok realUrl:realUrl via:via bAge:bAge honeypot:noItem];
     });
   });
 }
@@ -2177,18 +2267,21 @@ __attribute__((unused)) static NSString *ahaNewUuid(void) { return [[NSUUID UUID
 - (void)submit:(NSString *)taskId taskUrl:(NSString *)taskUrl result:(NSString *)result
         itemId:(NSString *)itemId acct:(NSString *)acct
       jxServer:(NSString *)jxServer token:(NSString *)token
-        realUrl:(NSString *)realUrl via:(NSString *)via bAge:(NSString *)bAge {
+        realUrl:(NSString *)realUrl via:(NSString *)via bAge:(NSString *)bAge
+       honeypot:(BOOL)honeypot {
   (void)jxServer; (void)token;   // 领单下发字段保留在签名里（调用点不动），提交一律走中枢
-  [self hubSubmit:taskId taskUrl:taskUrl result:result itemId:itemId acct:acct realUrl:realUrl via:via bAge:bAge];
+  [self hubSubmit:taskId taskUrl:taskUrl result:result itemId:itemId acct:acct realUrl:realUrl via:via bAge:bAge honeypot:honeypot];
 }
 
 - (void)hubSubmit:(NSString *)taskId taskUrl:(NSString *)taskUrl result:(NSString *)result
            itemId:(NSString *)itemId acct:(NSString *)acct
-           realUrl:(NSString *)realUrl via:(NSString *)via bAge:(NSString *)bAge {
+           realUrl:(NSString *)realUrl via:(NSString *)via bAge:(NSString *)bAge
+          honeypot:(BOOL)honeypot {
   [self api:@"/api/pool/submit" method:@"POST"
       body:@{ @"taskId": taskId, @"url": taskUrl, @"result": result,
               @"realUrl": realUrl ?: @"", @"via": via ?: @"",   // v0.5.49 真实来源URL + 通道（中枢对齐 Ajie 报文用）
               @"bAge": bAge ?: @"",                             // v0.5.52 包龄秒数（审核通过率按包新鲜度归因用）
+              @"honeypot": @(honeypot),                         // v0.5.53 商品不存在单：中枢成单+蜜罐计数+死商品缓存（v7.134 同款）
               @"itemId": itemId ?: @"", @"acct": acct ?: @"",
               @"profileId": self.cfg[@"pid"] ?: @"" }
       done:^(NSDictionary *j, NSError *e) {
