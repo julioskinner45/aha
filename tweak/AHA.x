@@ -1264,6 +1264,25 @@ static void ahaDelegateDidComplete(id self, SEL _cmd, id module, id requestLike,
       if ([urlObj isKindOfClass:[NSURL class]]) u = [(NSURL *)urlObj absoluteString] ?: @"";
     }
     // URL 已知且不是 pdp 端点 → 跳过；URL 未知（空串）→ inspectRawBody 只靠形状识别把关
+    // v0.5.60 miss 回包记录补 delegate 通道（v0.5.59 只挂了 completionHandler 包裹层，
+    // 中枢实测 resp 全空：delegate 才是虾皮主流量通道，any=16 resp=0 实锤）。
+    // 插在 pdp-only return 之前 → 任意端点都记；图片/CDN 类让位给 API 回包（非 shopee 域名满 12 条后不再记）
+    if (gMissResp) {
+      NSString *host = u.length ? ([NSURL URLWithString:u].host ?: @"") : @"";
+      BOOL shpLike = (host.length == 0) || ([host containsString:@"shopee"]);
+      @synchronized (gMissResp) {
+        if (gMissResp.count < (shpLike ? 25 : 12)) {
+          NSInteger st = 0;
+          if (isTask) {
+            id r = ((NSURLSessionTask *)requestLike).response;
+            if ([r isKindOfClass:[NSHTTPURLResponse class]]) st = ((NSHTTPURLResponse *)r).statusCode;
+          }
+          NSString *pre = [[NSString alloc] initWithData:bufData encoding:NSUTF8StringEncoding] ?: @"";
+          if (pre.length > 200) pre = [pre substringToIndex:200];
+          [gMissResp addObject:@{ @"u": u ?: @"", @"c": @(st), @"len": @(bufData.length), @"p": pre }];
+        }
+      }
+    }
     if (u.length && [u rangeOfString:kPdpMark].location == NSNotFound) return;
     NSString *body = [[NSString alloc] initWithData:bufData encoding:NSUTF8StringEncoding];
     [[AHACapture shared] inspectRawBody:body url:u request:req];
