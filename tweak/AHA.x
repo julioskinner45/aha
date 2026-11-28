@@ -1,5 +1,11 @@
 // AHA.x — Shopee app 内采集客户端（导航 = Ajie 逐字复刻 + 面包屑诊断）
 //
+// v0.5.72（2026-11-28）：验收门阈值纠偏（全灭真根因，0x3a5e0 逐指令核实）——
+//   v0.5.31 十字段门把 cmp #2 cset hi 误读成「最多缺2=至少8个非空」，
+//   Ajie 实际语义 = 非空数 > 2（≥3 即收）。新版 app pdp/get 字段变瘦：
+//   ≥3 过（Ajie 秒提交）、≥8 拒（我们静默丢包白 miss）——22:50-22:51 全灭实锤。
+//   非空判定补齐 0x3a5e0 语义（NSString.length>0 / 容器 count>0 / NSNumber 非 NSNull）。
+//
 // v0.5.56（2026-11-27）：虚拟设备指纹功能整体下线（用户令）。
 //   血泪实锤：种子在「插件登录」时写入，此时 Shopee 已跑起来、设备身份早已上报绑定，
 //   IDFV 中途变脸 → 服务端设备校验对不上 → 首页数据不下发白屏/掉登（实机复现）。
@@ -441,10 +447,13 @@ static NSDictionary *ahaNoItemFromBody(NSString *body, NSString *url) {
   }
 }
 
-// —— Ajie inspectCapturedData 的十字段门（0x37c04 逐指令复刻）：
+// —— Ajie 真验收门（0x3a5e0 逐指令复刻，0x36ddc/0x30a44 调用链核实）：
 // data.item（或 data.item_data.item）里 models/tier_variations/price/price_min/price_max/
-// stock/description/images/item_rating/shop_detailed 至少 8 个非空（汇编 cmp #2 cset hi=最多缺2）。
-// 不合格 = 商品页其它 pdp 端点回包/错误回包——交上去聚星受理但下游审核不记完成（今日 80% 完成率的根因）
+// stock/description/images/item_rating/shop_detailed 非空数 **> 2（≥3 即收）**。
+// v0.5.31 注释把 cmp #2 cset hi 误读成「最多缺2=至少8个」——方向读反了！
+// Ajie 实际要求 ≥3；新版 app pdp/get 字段变瘦后 ≥3 过、≥8 拒 = 22:50-22:51 全灭的根因。
+// 非空判定对齐 0x3a5e0：NSString 要 length>0，NSArray/NSDictionary 要 count>0，NSNumber 非 NSNull 即算。
+// 归属（item_id/shop_id 匹配当前任务）由存键+等包循环比对完成 = Ajie 0x30a44 深度搜索等价。
 static BOOL ahaPdpBodyValid(NSString *body) {
   if (body.length < 100) return NO;
   NSData *d = [body dataUsingEncoding:NSUTF8StringEncoding];
@@ -466,9 +475,13 @@ static BOOL ahaPdpBodyValid(NSString *body) {
   NSInteger have = 0;
   for (NSString *f in fields) {
     id v = item[f];
-    if (v && ![v isKindOfClass:[NSNull class]]) have++;
+    if (!v || [v isKindOfClass:[NSNull class]]) continue;
+    if ([v isKindOfClass:[NSString class]]) { if ([(NSString *)v length] > 0) have++; }
+    else if ([v isKindOfClass:[NSArray class]]) { if ([(NSArray *)v count] > 0) have++; }
+    else if ([v isKindOfClass:[NSDictionary class]]) { if ([(NSDictionary *)v count] > 0) have++; }
+    else have++;   // NSNumber 等：非 NSNull 即算（0x3a5e0 同款）
   }
-  return have >= 8;
+  return have > 2;   // Ajie 0x3a5e0：cmp x8,#2; cset hi = 非空数 > 2
 }
 
 // 真商品回包但字段不全 → 静默丢弃不入库（v0.5.37 用户令：不动手就不该有日志，门照常工作）
