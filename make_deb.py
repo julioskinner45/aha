@@ -47,7 +47,7 @@ S_ATTR_SOME_INSTRUCTIONS = 0x00000400
 
 DYLIB_NAME = 'AHA.dylib'
 PLIST_NAME = 'AHA.plist'
-PKG_VER = '0.5.64'
+PKG_VER = '0.5.65'
 
 
 def pad8(b):
@@ -257,6 +257,11 @@ def main():
     plist = open(os.path.join(HERE, 'tweak', PLIST_NAME), 'rb').read()
     panel = open(PANEL, 'rb').read() if PANEL and os.path.exists(PANEL) else None
     ctl = open(os.path.join(HERE, 'tweak', 'control'), encoding='utf-8').read()
+    # v0.5.65 死校验：control 模板的 Version 曾停在 0.5.52 七个版本没人发现（Sileo 显示旧版号，
+    # 文件名却是新版号）。从 PKG_VER 强制改写 Version 行，单一版本源，杜绝再犯。
+    import re as _re
+    ctl, n = _re.subn(r'(?m)^Version: .*$', 'Version: ' + PKG_VER, ctl)
+    assert n == 1, 'control 缺 Version 行'
     blob = build_deb(dylib, plist, panel, ctl)
 
     os.makedirs(OUT, exist_ok=True)
