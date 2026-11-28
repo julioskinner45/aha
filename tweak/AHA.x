@@ -15,6 +15,8 @@
 //   导航=openCurrentTask 时序（popToRoot→0.35s→内路由→失败 Universal Link openURL 兜底，不再 Direct PDP 当导航用）；
 //   风控=删弹窗，266900002 按正常响应提交，90309999 自动停，直连失败不计风控，连续 2 次无数据自动暂停；
 //   v0.5.64 等包节奏=5s/轮×重试2次（重进商品页），3轮全空+直连终审也空=任务回池+脚本暂停（用户令）
+//   v0.5.67 重试先回根再进详情（用户令）：人站在商品页直接 openURL 同链接=app 不重载只吃缓存，
+//     永远截不到新包；对齐 Ajie 每次进详情前 popToRoot 0x21db0
 //   v0.5.66 直连终审（Ajie 0.1.3 Direct PDP 反汇编 0x3d588/0x2bcfc/0x2fd04 对齐）：
 //     3轮截包全空后用记住的真实请求头直连 get_pc——回包=商品数据（提交）/266900002（死商品→提交）/
 //     90309999（墙→回池+暂停）。实锤场景：页面渲染完整但 app 不发数据请求（缓存渲染/反爬静默），截包永远空
@@ -1975,11 +1977,18 @@ static void ahaLog(NSString *lv, NSString *msg) {
        （v0.5.52 的 15s 单轮硬顶由此替代；noitem 双通道在每轮里照常生效，命中即提交不重试） */
     for (int attempt = 0; attempt < 3 && !capInfo; attempt++) {
       if (attempt > 0) {
-        ahaLog(@"w", [NSString stringWithFormat:@"第 %ld 次重试：重进商品页再等 5 秒", (long)attempt]);
+        // v0.5.67 用户令：重试必须先退出商品页（回根）再进——人还在商品页上直接 openURL
+        // 同一链接，app 认为「已在详情页」不重新加载，只吃缓存渲染，永远截不到新包。
+        // Ajie 每次进详情前都走 popToRootViewControllerIfNeeded 0x21db0，这里对齐。
+        ahaLog(@"w", [NSString stringWithFormat:@"第 %ld 次重试：回根→重进商品页再等 5 秒", (long)attempt]);
         ahaStep(@"任务:重试重进商品");
         dispatch_async(dispatch_get_main_queue(), ^{
-          ahaOpenUniversalLink(shopId, itemId, taskUrl);
-          ahaObserveBegin();   /* 观察窗归零重计本单 */
+          ahaPopToRootIfNeeded();          /* 先把 RN 商品页销毁 */
+          dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+              dispatch_get_main_queue(), ^{
+            ahaOpenUniversalLink(shopId, itemId, taskUrl);
+            ahaObserveBegin();   /* 观察窗归零重计本单 */
+          });
         });
       }
       for (int i = 0; i < 10 && !capInfo; i++) {
