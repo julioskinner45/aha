@@ -17,6 +17,9 @@
 //   v0.5.64 等包节奏=5s/轮×重试2次（重进商品页），3轮全空+直连终审也空=任务回池+脚本暂停（用户令）
 //   v0.5.67 重试先回根再进详情（用户令）：人站在商品页直接 openURL 同链接=app 不重载只吃缓存，
 //     永远截不到新包；对齐 Ajie 每次进详情前 popToRoot 0x21db0
+//   v0.5.68 晚到包补收（新版 app 实锤：RN 页两段式加载，任务商品 pdp/get 10~15s 才落地，
+//     20:38 单 181KB 200 包排在窗尾白 miss）——直连每候选前+终审落幕都补查截包缓存，
+//     app 的包到了就提交不发直连（少污染 SGW=少 418）；等包窗口容忍度对齐 Ajie 20s+direct
 //   v0.5.66 直连终审（Ajie 0.1.3 Direct PDP 反汇编 0x3d588/0x2bcfc/0x2fd04 对齐）：
 //     3轮截包全空后用记住的真实请求头直连 get_pc——回包=商品数据（提交）/266900002（死商品→提交）/
 //     90309999（墙→回池+暂停）。实锤场景：页面渲染完整但 app 不发数据请求（缓存渲染/反爬静默），截包永远空
@@ -2046,9 +2049,21 @@ static void ahaLog(NSString *lv, NSString *msg) {
       if (diDirect && [(NSString *)diDirect[@"body"] length] > 100) {
         capInfo = diDirect; info = diDirect; body = diDirect[@"body"];
         noItem = [[diDirect objectForKey:@"noitem"] boolValue];
-        via = noItem ? @"noitem" : @"DirectPDP";
-        ahaLog(@"i", [NSString stringWithFormat:@"直连终审拿到%@报文，提交",
-            noItem ? @"死商品" : @"商品"]);
+        BOOL late = [[diDirect objectForKey:@"late"] boolValue];
+        via = noItem ? @"noitem" : (late ? @"app截包" : @"DirectPDP");
+        ahaLog(@"i", [NSString stringWithFormat:@"直连终审窗口内%@包落地，提交（%@）",
+            late ? @"app 截到（晚到补收）" : (noItem ? @"拿到死商品" : @"拿到商品"), via]);
+      }
+    }
+    /* v0.5.68 对齐 Ajie：终审落幕后最后一查——直连 22s 窗口内 app 的 pdp 包可能刚落地
+       （新版 app 两段式加载实锤：20:38 那单任务商品 181KB 200 包排在窗尾，白 miss）。
+       包在=照常提交，不回池不 riskStop。 */
+    if (!body) {
+      NSDictionary *lateInfo = [[AHACapture shared] bodyInfoForShop:shopId item:itemId];
+      if (lateInfo && [(NSString *)lateInfo[@"body"] length] > 100) {
+        capInfo = lateInfo; info = lateInfo; body = lateInfo[@"body"];
+        noItem = NO; via = @"app截包";
+        ahaLog(@"i", @"终审窗口内 app 的包晚到落地，补收提交（不回池）");
       }
     }
     if (!body) {
@@ -2264,6 +2279,13 @@ static NSString *ahaDirectOnce(NSString *url, NSDictionary *ctx, NSTimeInterval 
   // 总预算 22s 封顶（多候选串行不能把「进详情」拖成分钟级；Ajie 单次 15s，这里同量级）
   NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:22];
   for (NSString *url in cands) {
+    /* v0.5.68 对齐 Ajie（新版 app 逐条对比实锤）：新版虾皮 RN 页是「prefill→残留页→正确页」
+       两段式加载，app 对任务商品的 pdp/get 常 10~15s 才落地——Ajie waitingForPDP 20s 等得起。
+       我们等包 15s 窗口关得早，app 的包在直连窗口内落地=白白 miss 还白白污染 SGW（418 根源）。
+       每个候选前先查截包缓存：app 的包到了就立刻收货，不再发直连。 */
+    NSDictionary *late = [[AHACapture shared] bodyInfoForShop:shopId item:itemId];
+    if (late && [(NSString *)late[@"body"] length] > 100)
+      return @{ @"body": late[@"body"], @"url": late[@"url"] ?: @"", @"late": @YES };
     NSTimeInterval left = [deadline timeIntervalSinceNow];
     if (left < 2) break;
     BOOL wall = NO;
