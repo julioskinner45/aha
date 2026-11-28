@@ -17,9 +17,11 @@
 //   v0.5.64 等包节奏=5s/轮×重试2次（重进商品页），3轮全空+直连终审也空=任务回池+脚本暂停（用户令）
 //   v0.5.67 重试先回根再进详情（用户令）：人站在商品页直接 openURL 同链接=app 不重载只吃缓存，
 //     永远截不到新包；对齐 Ajie 每次进详情前 popToRoot 0x21db0
-//   v0.5.69 直连并行点火（Ajie 反汇编 0x31560/0x31ba4 实测语义纠偏）：
-//     pdpContextReady（第一条 app pdp 请求头记住）即发直连与截包赛跑，20s 只是重试看门狗
-//     ——此前干等 3 轮全空才发 = 白吃新版 app 两段式加载 10~15s 延迟（Ajie 秒提交差距根源）
+//   v0.5.70 用户令（Ajie 全图复核定论）：①自动直连整体删除——requestCurrentTaskDirectly 0x31560
+//     全二进制唯一调用点=自身 20s 重试看门狗，日志原文「请先手动打开一个商品」=手动诊断工具，
+//     生产路径零直连；我们的直连重放=SGW 418 升级污染源嫌疑。②失败节奏改 Ajie
+//     handleNoDataCapture 0x23b80 1:1：连续 1 次全空=放弃本单继续下一单，连续 2 次=风控停
+//   v0.5.69 直连并行点火（已被 v0.5.70 推翻：那是手动诊断通道不是生产路径）
 //   v0.5.68 晚到包补收（新版 app 实锤：RN 页两段式加载，任务商品 pdp/get 10~15s 才落地，
 //     20:38 单 181KB 200 包排在窗尾白 miss）——直连每候选前+终审落幕都补查截包缓存，
 //     app 的包到了就提交不发直连（少污染 SGW=少 418）；等包窗口容忍度对齐 Ajie 20s+direct
@@ -1978,17 +1980,13 @@ static void ahaLog(NSString *lv, NSString *msg) {
        「你尋找的商品已不存在」不受影响：noitem 报文信号 + 弹窗文案识别双通道照旧，
        命中即提交错误报文，聚星收了算成单（用户令：这类单必须提交，有钱）。 */
     __block NSString *pageNoItemHit = nil, *pageSample = nil;   // v0.5.56 主线程页面扫描结果回传
-    /* v0.5.69 = Ajie 反汇编实测语义（0x31560 直连主入口 + 0x31ba4 首发点 + 0x2ee74 performDirectPDP 本体）：
-       directPDPEnabled + pdpContextReady（app 第一条 pdp 请求过钩子、头已记住）→ appendLog
-       "Direct PDP(AppHeader)" → 立刻 performDirectPDPRequestWithURLs（单次 15s 超时），
-       与页面截包并行赛跑；dispatch_after 20s 的块只是「还在等才重试」的看门狗，不是首发等待。
-       此前我们干等 3 轮全空才发直连 = 白吃新版 app 两段式加载的 10~15s 延迟（Ajie 秒提交的差距根源）。
-       直连内部的晚到包门（v0.5.68）保证：app 的包先到就不发直连。 */
-    __block NSDictionary *diDirect = nil;   // v0.5.66 直连终审结果（miss 存档用）
-    __block BOOL directFired = NO;
-    dispatch_semaphore_t dsem = dispatch_semaphore_create(0);
-    /* v0.5.64 用户令节奏：进入商品后 5s 没截到包 → 重试（重进商品页），最多重试 2 次（共 3 轮×5s）；
-       3 轮全空 = 任务回池 + 脚本暂停——八成是风控/验证墙，别再烧单。
+    /* v0.5.70 用户令（Ajie 反汇编全图复核后的最终定论）：自动直连整体删除——
+       requestCurrentTaskDirectly 0x31560 全二进制唯一调用点=它自己的 20s 重试看门狗
+       trampoline（0x31dc8），外加「直连会话未就绪，请先手动打开一个商品」等日志原文
+       ——它是手动诊断工具，生产路径零直连。我们的直连（老端点重放）反而是 SGW 418
+       升级的污染源嫌疑。失败节奏同步改 Ajie handleNoDataCapture 0x23b80 语义：
+       连续 1 次全空=放弃本单继续下一单，连续 2 次=noteCaptureFailure 内部 riskStop。 */
+    /* v0.5.64 用户令节奏：进入商品后 5s 没截到包 → 重试（重进商品页），最多重试 2 次（共 3 轮×5s）。
        （v0.5.52 的 15s 单轮硬顶由此替代；noitem 双通道在每轮里照常生效，命中即提交不重试） */
     for (int attempt = 0; attempt < 3 && !capInfo; attempt++) {
       if (attempt > 0) {
@@ -2015,21 +2013,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
         NSDictionary *ni = [[AHACapture shared] takeNoItemForShop:shopId item:itemId];
         if (ni) { capInfo = @{ @"body": ni[@"body"] ?: @"", @"url": ni[@"url"] ?: @"", @"noitem": @YES }; break; }
       }
-      // v0.5.69 Ajie 同款并行点火：pdp 上下文（app 请求头）一就绪就发直连，不等轮空。
-      // 直连线程与等包循环赛跑；包晚到时直连内部 v0.5.68 门会改收晚到包（late=YES）。
-      if (!directFired && !capInfo) {
-        NSDictionary *c0 = [[AHACapture shared] contextCopy];
-        if (c0.count) {
-          directFired = YES;
-          ahaLog(@"i", @"pdp 上下文就绪，直连并行点火（Ajie Direct PDP 同款）");
-          ahaStep(@"任务:DirectPDP并行");
-          dispatch_async(dispatch_get_global_queue(0, 0), ^{
-            NSDictionary *d = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
-            diDirect = d;
-            dispatch_semaphore_signal(dsem);
-          });
-        }
-      }
+      // v0.5.70：自动直连删除（Ajie 生产路径零直连），等包循环纯等 app 自己的回包
       // v0.5.56 页面级「商品已不存在」识别（用户令：这类单直接提交，不点火直连）：
       // 导航后 app 没发 pdp 请求、页面直接显示「你尋找的商品已不存在」——扫 UI 文案命中即构造
       // 标准 error 报文提交（对齐窗口端 v7.121 错误报文原样提交=聚星算有效数据）。
@@ -2062,46 +2046,11 @@ static void ahaLog(NSString *lv, NSString *msg) {
     NSString *via = noItem ? @"noitem" : @"app截包";
     NSString *body = info[@"body"];
     if (!body) {
-      /* v0.5.66 对齐 Ajie 0.1.3 Direct PDP（0x3d588/0x2bcfc/0x2fd04 反汇编）：
-         Ajie 并非「无备用方案」——它是页面等 20s（waitingForPDP 看门狗）没等到 pdp 回包时，
-         用 rememberRequestContextFromRequest 存下的 app 真实请求头，自己直连 get_pc 终审：
-         回包要么是商品数据（提交）、要么 error 266900002（死商品→照样提交）、要么 90309999（墙→放弃）。
-         用户令保留：3 轮重试 + 失败回池暂停（直连终审也拿不到才停）。
-         v0.5.69：直连已在等包期间并行点火（contextCopy 就绪即发，Ajie 同款），这里收并发结果；
-         上下文始终没就绪（app 一条 pdp 都没发过）才在这里同步补发。 */
-      if (directFired) {
-        ahaLog(@"i", @"3 轮没截到包，收直连并行结果");
-        dispatch_semaphore_wait(dsem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(26 * NSEC_PER_SEC)));
-      } else {
-        ahaLog(@"i", @"3 轮没截到包且无 pdp 上下文，直连 get_pc 终审");
-        ahaStep(@"任务:DirectPDP终审");
-        diDirect = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
-      }
-      if (diDirect && [(NSString *)diDirect[@"body"] length] > 100) {
-        capInfo = diDirect; info = diDirect; body = diDirect[@"body"];
-        noItem = [[diDirect objectForKey:@"noitem"] boolValue];
-        BOOL late = [[diDirect objectForKey:@"late"] boolValue];
-        via = noItem ? @"noitem" : (late ? @"app截包" : @"DirectPDP");
-        ahaLog(@"i", [NSString stringWithFormat:@"直连终审窗口内%@包落地，提交（%@）",
-            late ? @"app 截到（晚到补收）" : (noItem ? @"拿到死商品" : @"拿到商品"), via]);
-      }
-    }
-    /* v0.5.68 对齐 Ajie：终审落幕后最后一查——直连 22s 窗口内 app 的 pdp 包可能刚落地
-       （新版 app 两段式加载实锤：20:38 那单任务商品 181KB 200 包排在窗尾，白 miss）。
-       包在=照常提交，不回池不 riskStop。 */
-    if (!body) {
-      NSDictionary *lateInfo = [[AHACapture shared] bodyInfoForShop:shopId item:itemId];
-      if (lateInfo && [(NSString *)lateInfo[@"body"] length] > 100) {
-        capInfo = lateInfo; info = lateInfo; body = lateInfo[@"body"];
-        noItem = NO; via = @"app截包";
-        ahaLog(@"i", @"终审窗口内 app 的包晚到落地，补收提交（不回池）");
-      }
-    }
-    if (!body) {
-      /* v0.5.64 用户令：3 轮重试全空 = 任务回池 + 脚本立即暂停（原先连续 2 次才停太宽容，
-         一单烧 3 轮还不停 = 后面全是同款死页/验证墙，停了人工看） */
-      ahaLog(@"e", @"3 轮重试全没截到包，任务回池并暂停（疑似风控/验证墙）");
-      dispatch_async(self.q, ^{ [self riskStop]; });
+      /* v0.5.70 = Ajie handleNoDataCapture(0x23b80) 1:1：
+         连续 1 次全空 → 放弃本单继续下一单（failStreak=1，下面 scheduleNext 照常领新单）；
+         连续 2 次 → noteCaptureFailure 内部 riskStop（handleRiskControlDetected 同款）。
+         截到包的下一单会把 failStreak 清零（body 分支），波动自愈。 */
+      [self noteCaptureFailure:NO];
       // v0.5.52 超时诊断（观察窗 v0.528 改静默后数据白丢——把关键三数打回来）：
       // pdp请求=0 且页面在列表 = 导航没真开/白板页；pdp请求>0 = 发了但回包没进门（另查）
       dispatch_async(dispatch_get_main_queue(), ^{
@@ -2129,15 +2078,14 @@ static void ahaLog(NSString *lv, NSString *msg) {
         [self api:@"/api/pool/miss" method:@"POST"
             body:@{ @"taskId": taskId, @"itemId": itemId ?: @"", @"shopId": shopId ?: @"",
                     @"taskUrl": taskUrl ?: @"", @"pid": pid ?: @"", @"acct": acct ?: @"",
-                    @"pdp": @(gObsPdp), @"any": @(gObsAny), @"direct": @(diDirect != nil),   // v0.5.66 直连终审已尝试
+                    @"pdp": @(gObsPdp), @"any": @(gObsAny), @"direct": @NO,   // v0.5.70 自动直连已删
                     @"topVC": NSStringFromClass([vc class]) ?: @"", @"page": ps,
                     @"errUrl": pniUrl, @"errBody": pniBody,
                     @"resp": (gMissResp ? [gMissResp copy] : @[]) }   // v0.5.59 窗口全部回包（URL+码+长度+前200字）
              done:nil];
         ahaObserveFlush();
       });
-      /* v0.5.64 用户令：3 轮重试全空 → 任务回池 + 脚本暂停（开头已 riskStop，
-         这里走正常回池上报，scheduleNext 不会再领新单——running 已 NO） */
+      // v0.5.70：running 不再立刻置 NO（第 1 次失败继续跑）；连续 2 次 noteCaptureFailure 才 riskStop
     }
     if (body) dispatch_async(self.q, ^{ self.failStreak = 0; gPool.risk = NO; });
     // 白板自清理：这一单走完（成/败都一样），把商品页退掉——
