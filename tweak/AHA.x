@@ -17,6 +17,9 @@
 //   v0.5.64 等包节奏=5s/轮×重试2次（重进商品页），3轮全空+直连终审也空=任务回池+脚本暂停（用户令）
 //   v0.5.67 重试先回根再进详情（用户令）：人站在商品页直接 openURL 同链接=app 不重载只吃缓存，
 //     永远截不到新包；对齐 Ajie 每次进详情前 popToRoot 0x21db0
+//   v0.5.69 直连并行点火（Ajie 反汇编 0x31560/0x31ba4 实测语义纠偏）：
+//     pdpContextReady（第一条 app pdp 请求头记住）即发直连与截包赛跑，20s 只是重试看门狗
+//     ——此前干等 3 轮全空才发 = 白吃新版 app 两段式加载 10~15s 延迟（Ajie 秒提交差距根源）
 //   v0.5.68 晚到包补收（新版 app 实锤：RN 页两段式加载，任务商品 pdp/get 10~15s 才落地，
 //     20:38 单 181KB 200 包排在窗尾白 miss）——直连每候选前+终审落幕都补查截包缓存，
 //     app 的包到了就提交不发直连（少污染 SGW=少 418）；等包窗口容忍度对齐 Ajie 20s+direct
@@ -1975,6 +1978,15 @@ static void ahaLog(NSString *lv, NSString *msg) {
        「你尋找的商品已不存在」不受影响：noitem 报文信号 + 弹窗文案识别双通道照旧，
        命中即提交错误报文，聚星收了算成单（用户令：这类单必须提交，有钱）。 */
     __block NSString *pageNoItemHit = nil, *pageSample = nil;   // v0.5.56 主线程页面扫描结果回传
+    /* v0.5.69 = Ajie 反汇编实测语义（0x31560 直连主入口 + 0x31ba4 首发点 + 0x2ee74 performDirectPDP 本体）：
+       directPDPEnabled + pdpContextReady（app 第一条 pdp 请求过钩子、头已记住）→ appendLog
+       "Direct PDP(AppHeader)" → 立刻 performDirectPDPRequestWithURLs（单次 15s 超时），
+       与页面截包并行赛跑；dispatch_after 20s 的块只是「还在等才重试」的看门狗，不是首发等待。
+       此前我们干等 3 轮全空才发直连 = 白吃新版 app 两段式加载的 10~15s 延迟（Ajie 秒提交的差距根源）。
+       直连内部的晚到包门（v0.5.68）保证：app 的包先到就不发直连。 */
+    __block NSDictionary *diDirect = nil;   // v0.5.66 直连终审结果（miss 存档用）
+    __block BOOL directFired = NO;
+    dispatch_semaphore_t dsem = dispatch_semaphore_create(0);
     /* v0.5.64 用户令节奏：进入商品后 5s 没截到包 → 重试（重进商品页），最多重试 2 次（共 3 轮×5s）；
        3 轮全空 = 任务回池 + 脚本暂停——八成是风控/验证墙，别再烧单。
        （v0.5.52 的 15s 单轮硬顶由此替代；noitem 双通道在每轮里照常生效，命中即提交不重试） */
@@ -2002,6 +2014,21 @@ static void ahaLog(NSString *lv, NSString *msg) {
       if (!capInfo) {
         NSDictionary *ni = [[AHACapture shared] takeNoItemForShop:shopId item:itemId];
         if (ni) { capInfo = @{ @"body": ni[@"body"] ?: @"", @"url": ni[@"url"] ?: @"", @"noitem": @YES }; break; }
+      }
+      // v0.5.69 Ajie 同款并行点火：pdp 上下文（app 请求头）一就绪就发直连，不等轮空。
+      // 直连线程与等包循环赛跑；包晚到时直连内部 v0.5.68 门会改收晚到包（late=YES）。
+      if (!directFired && !capInfo) {
+        NSDictionary *c0 = [[AHACapture shared] contextCopy];
+        if (c0.count) {
+          directFired = YES;
+          ahaLog(@"i", @"pdp 上下文就绪，直连并行点火（Ajie Direct PDP 同款）");
+          ahaStep(@"任务:DirectPDP并行");
+          dispatch_async(dispatch_get_global_queue(0, 0), ^{
+            NSDictionary *d = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
+            diDirect = d;
+            dispatch_semaphore_signal(dsem);
+          });
+        }
       }
       // v0.5.56 页面级「商品已不存在」识别（用户令：这类单直接提交，不点火直连）：
       // 导航后 app 没发 pdp 请求、页面直接显示「你尋找的商品已不存在」——扫 UI 文案命中即构造
@@ -2034,18 +2061,22 @@ static void ahaLog(NSString *lv, NSString *msg) {
     BOOL noItem = [[info objectForKey:@"noitem"] boolValue];   // v0.5.53 商品不存在单
     NSString *via = noItem ? @"noitem" : @"app截包";
     NSString *body = info[@"body"];
-    __block NSDictionary *diDirect = nil;   // v0.5.66 直连终审结果（miss 存档用）
     if (!body) {
       /* v0.5.66 对齐 Ajie 0.1.3 Direct PDP（0x3d588/0x2bcfc/0x2fd04 反汇编）：
          Ajie 并非「无备用方案」——它是页面等 20s（waitingForPDP 看门狗）没等到 pdp 回包时，
          用 rememberRequestContextFromRequest 存下的 app 真实请求头，自己直连 get_pc 终审：
          回包要么是商品数据（提交）、要么 error 266900002（死商品→照样提交）、要么 90309999（墙→放弃）。
-         今晚 20:30 后 15 单全灭的实锤：页面渲染完整但 pdp请求=0 全部请求=2~3（纯埋点）——
-         app 压根不发数据请求（缓存渲染/反爬静默），截包永远空，只有直连能破局。
-         用户令保留：3 轮重试 + 失败回池暂停（直连终审也拿不到才停）。 */
-      ahaLog(@"i", @"3 轮没截到包，直连 get_pc 终审（Ajie 0.1.3 Direct PDP 同款）");
-      ahaStep(@"任务:DirectPDP终审");
-      diDirect = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
+         用户令保留：3 轮重试 + 失败回池暂停（直连终审也拿不到才停）。
+         v0.5.69：直连已在等包期间并行点火（contextCopy 就绪即发，Ajie 同款），这里收并发结果；
+         上下文始终没就绪（app 一条 pdp 都没发过）才在这里同步补发。 */
+      if (directFired) {
+        ahaLog(@"i", @"3 轮没截到包，收直连并行结果");
+        dispatch_semaphore_wait(dsem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(26 * NSEC_PER_SEC)));
+      } else {
+        ahaLog(@"i", @"3 轮没截到包且无 pdp 上下文，直连 get_pc 终审");
+        ahaStep(@"任务:DirectPDP终审");
+        diDirect = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
+      }
       if (diDirect && [(NSString *)diDirect[@"body"] length] > 100) {
         capInfo = diDirect; info = diDirect; body = diDirect[@"body"];
         noItem = [[diDirect objectForKey:@"noitem"] boolValue];
