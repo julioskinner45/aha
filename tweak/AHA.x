@@ -21,6 +21,12 @@
 //     全二进制唯一调用点=自身 20s 重试看门狗，日志原文「请先手动打开一个商品」=手动诊断工具，
 //     生产路径零直连；我们的直连重放=SGW 418 升级污染源嫌疑。②失败节奏改 Ajie
 //     handleNoDataCapture 0x23b80 1:1：连续 1 次全空=放弃本单继续下一单，连续 2 次=风控停
+//   v0.5.71 全灭根因修复（Ajie invokeRouteNavigationOnManager 0x2621c 指令级对齐）：
+//     ahaInvoke 此前 invoke 不抛异常就返回 YES，Shopee navigate 真实返回 NO 也当成功
+//     →假成功→app 没跳→pdp=0→截包全灭（22:19 实锤；Ajie 同机同号同 IP 每单 3~4 秒）。
+//     修：①ahaInvoke 读目标方法真实返回值 ②导航梯统一 ahaNavigateToProduct
+//     （内路由→商品直开三连→UL，任一层真值=跳转成功，Ajie 语义不验证 topVC）
+//     ③重试=完整重走导航梯，不再只发 UL
 //   v0.5.69 直连并行点火（已被 v0.5.70 推翻：那是手动诊断通道不是生产路径）
 //   v0.5.68 晚到包补收（新版 app 实锤：RN 页两段式加载，任务商品 pdp/get 10~15s 才落地，
 //     20:38 单 181KB 200 包排在窗尾白 miss）——直连每候选前+终审落幕都补查截包缓存，
@@ -662,7 +668,21 @@ static BOOL ahaInvoke(id target, SEL sel, NSArray *args, NSString *tag) {
       }
     }
     [inv invoke];
-    return YES;
+    /* v0.5.71 对齐 Ajie invokeSelector:onTarget:arguments:（0x26370 实证）：返回目标方法的
+       真实返回值。此前只要不抛异常就返回 YES——Shopee 的 navigate 返回 NO（路由拒绝/路径
+       不认）我们也当成功，假成功后 app 根本没跳（22:19 实锤 pdp=0 全部请求=2、Ajie 同机
+       同号同 IP 每单「跳转成功」1 秒出数据），后续层级永远没机会跑 = 全灭根因。 */
+    const char *rt = [sig methodReturnType];
+    if (!rt || !rt[0] || rt[0] == 'v') return YES;   // 无返回值：调用成功即成功
+    if (rt[0] == 'c' || rt[0] == 'B' || rt[0] == 'Z') { BOOL v = NO; [inv getReturnValue:&v]; return v; }
+    if (rt[0] == '@') { __unsafe_unretained id v = nil; [inv getReturnValue:&v]; return v != nil; }
+    if (rt[0] == 'q' || rt[0] == 'l' || rt[0] == 'i' || rt[0] == 's') {
+      long long v = 0; [inv getReturnValue:&v]; return v != 0;
+    }
+    if (rt[0] == 'Q' || rt[0] == 'L' || rt[0] == 'I' || rt[0] == 'S') {
+      unsigned long long v = 0; [inv getReturnValue:&v]; return v != 0;
+    }
+    return YES;   // 其他类型（浮点等）：调用成功即成功
   } @catch (NSException *e) {
     ahaLog(@"w", [NSString stringWithFormat:@"内路由[%@]调用异常：%@", tag, e.reason]);
     return NO;
@@ -1034,6 +1054,36 @@ static void ahaOpenUniversalLink(NSString *shopId, NSString *itemId, NSString *t
     completionHandler:^(BOOL ok) {
       ahaLog(ok ? @"i" : @"w", ok ? @"进入详情成功" : @"进入详情重试（不弹网页）");
     }];
+}
+
+// —— v0.5.71 Ajie 导航梯 1:1（invokeRouteNavigationOnManager 0x2621c 指令级复刻）：
+// 层级顺序与判定语义全对齐：内路由（navigate/push × 5 route 格式）→ 商品直开三连
+// （navigateToProduct:goodID: → openProductPage:goodID: → openProduct:goodID:）
+// → Universal Link 兜底（UniversalLinksOnly 保证 app 内跳转，绝不弹网页）。
+// 每层以目标方法真实返回值为准（ahaInvoke v0.5.71 语义），任一层真值即「跳转成功」；
+// Ajie 面板每单 3~4 秒的节奏就来自第一层真值 + 1 秒出包。
+static BOOL ahaNavigateToProduct(NSString *shopId, NSString *itemId, NSString *taskUrl) {
+  NSArray *routes = @[
+    [NSString stringWithFormat:@"rn/PRODUCT_PAGE?itemid=%@&shopid=%@", itemId, shopId],   // ← Ajie 主格式
+    [NSString stringWithFormat:@"rn/PRODUCT_PAGE?item_id=%@&shop_id=%@", itemId, shopId],
+    [NSString stringWithFormat:@"rn/PRODUCT_PAGE?good_id=%@&shop_id=%@", itemId, shopId],
+    [NSString stringWithFormat:@"rn/PRODUCT_PAGE?shopid=%@&itemid=%@", shopId, itemId],
+    [NSString stringWithFormat:@"PRODUCT_PAGE?itemid=%@&shopid=%@", itemId, shopId],
+  ];
+  ahaStep(@"导航:开始");
+  BOOL ok = NO;
+  @try { ok = ahaTryRouteInvokes(routes); } @catch (NSException *e) {
+    ahaLog(@"e", [NSString stringWithFormat:@"导航异常:%@", e.reason]);
+  }
+  if (!ok) @try { ok = ahaTryDirectOpens(shopId, itemId); } @catch (__unused NSException *e) { ok = NO; }
+  ahaStep(@"导航:结束");
+  if (!ok) {
+    ahaLog(@"w", @"内路由全层无真值，Universal Link 兜底（app 内）");
+    ahaOpenUniversalLink(shopId, itemId, taskUrl);
+    return NO;
+  }
+  ahaLog(@"i", @"跳转成功");
+  return YES;
 }
 
 #pragma mark - 观察钩子（Ajie 同款：包 completionHandler，不碰 protocolClasses）
@@ -1899,68 +1949,18 @@ static void ahaLog(NSString *lv, NSString *msg) {
   ahaLog(@"s", @"抢单成功");
   ahaRefreshUI();
 
-  // 导航 = Ajie openCurrentTask 0x2f7fc 时序 1:1 + 页面真跳验证：
-  // popToRootViewControllerIfNeeded → 0.35s → 内路由（4 route × navigate/push）
-  // → 1.2s 后验证 topVC 是否真的变了（invoke 不抛异常≠页面跳了）
-  // → 没变 → 商品直开三连 → 再验证 → 全无效 → Universal Link 兜底（页面必须真开）
+  // 导航 = Ajie openCurrentTask 0x2f7fc + invokeRouteNavigationOnManager 0x2621c 时序 1:1：
+  // popToRootViewControllerIfNeeded → 0.35s → ahaNavigateToProduct 导航梯
+  // （内路由 navigate/push × 5 route → 商品直开三连，每层以目标方法真实返回值为准）
+  // → 任一层真值 = 「跳转成功」（Ajie 不做页面验证，同款信任）；全层无真值 → UL 兜底。
+  // v0.5.71 删 topVC 验证迷宫：ahaInvoke 假成功已根治，且 topVC 变化可被人手点页面污染
+  //（22:19 「进入详情成功」实为用户手点，真跳与否由等包结果说话）。
   dispatch_async(dispatch_get_main_queue(), ^{
     ahaPopToRootIfNeeded();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{
-      UIViewController *before = ahaResolvedTopVC();
-      // v0.5.25 = Ajie openCurrentTask 0x2f7fc+navigateWithBTManagerToRoute 0x23fb0 逐指令对齐：
-      // Ajie 主入口传入的 route 是 'rn/PRODUCT_PAGE?itemid=%@&shopid=%@'（无下划线），
-      // navigateWith 把它排在数组第 0 位，后面才是 item_id/good_id/shopid/PRODUCT_PAGE 四个备胎。
-      // 我们此前从没发过第 0 位的无下划线格式——若解析器只认 itemid/shopid，
-      // 我们打开的就是无商品参数的空壳 RN 页（页开了、数据死，症状完全吻合）
-      NSArray *routes = @[
-        [NSString stringWithFormat:@"rn/PRODUCT_PAGE?itemid=%@&shopid=%@", itemId, shopId],   // ← Ajie 主格式
-        [NSString stringWithFormat:@"rn/PRODUCT_PAGE?item_id=%@&shop_id=%@", itemId, shopId],
-        [NSString stringWithFormat:@"rn/PRODUCT_PAGE?good_id=%@&shop_id=%@", itemId, shopId],
-        [NSString stringWithFormat:@"rn/PRODUCT_PAGE?shopid=%@&itemid=%@", shopId, itemId],
-        [NSString stringWithFormat:@"PRODUCT_PAGE?itemid=%@&shopid=%@", itemId, shopId],
-      ];
-      BOOL invoked = NO;
-      ahaStep(@"导航:开始");
-      @try { invoked = ahaTryRouteInvokes(routes); } @catch (NSException *e) {
-        ahaLog(@"e", [NSString stringWithFormat:@"导航异常:%@", e.reason]);
-      }
-      ahaStep(@"导航:结束");
-      if (!invoked) {
-        ahaLog(@"w", @"进入详情重试");
-        ahaOpenUniversalLink(shopId, itemId, taskUrl);
-        ahaObserveBegin();
-        return;
-      }
-      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-          dispatch_get_main_queue(), ^{
-        UIViewController *after = ahaResolvedTopVC();
-        if (after && after != before) {
-          ahaLog(@"i", @"进入详情成功");   // v0.5.30 四状态：抢单成功/进入详情成功/提交中/提交成功
-          ahaObserveBegin();
-          return;
-        }
-        // route「调用成功」但页面没动 → 商品直开三连 → 再验证 → UL 兜底
-        BOOL d = NO;
-        @try { d = ahaTryDirectOpens(shopId, itemId); } @catch (__unused NSException *e) { d = NO; }
-        if (!d) {
-          ahaLog(@"w", @"进入详情重试");
-          ahaOpenUniversalLink(shopId, itemId, taskUrl);
-          ahaObserveBegin();
-          return;
-        }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-            dispatch_get_main_queue(), ^{
-          UIViewController *after2 = ahaResolvedTopVC();
-          if (after2 && after2 != before) {
-            // v0.5.28 精简：商品直开成功不再刷日志
-          } else {
-            ahaLog(@"w", @"进入详情重试");
-            ahaOpenUniversalLink(shopId, itemId, taskUrl);
-          }
-          ahaObserveBegin();
-        });
-      });
+      ahaNavigateToProduct(shopId, itemId, taskUrl);
+      ahaObserveBegin();
     });
   });
 
@@ -1999,7 +1999,9 @@ static void ahaLog(NSString *lv, NSString *msg) {
           ahaPopToRootIfNeeded();          /* 先把 RN 商品页销毁 */
           dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
               dispatch_get_main_queue(), ^{
-            ahaOpenUniversalLink(shopId, itemId, taskUrl);
+            /* v0.5.71 重试 = 完整重走 Ajie 导航梯（内路由→直开→UL），与首次进详情完全同款——
+               Ajie 重试就是整跑 openCurrentTask；此前重试只发 UL，内路由层级根本没参与 */
+            ahaNavigateToProduct(shopId, itemId, taskUrl);
             ahaObserveBegin();   /* 观察窗归零重计本单 */
           });
         });
