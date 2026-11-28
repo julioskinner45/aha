@@ -1,5 +1,13 @@
 // AHA.x — Shopee app 内采集客户端（导航 = Ajie 逐字复刻 + 面包屑诊断）
 //
+// v0.5.73（2026-11-28）用户令四项：
+//   ①风控（90309999）即停即废：等包循环/重试梯整体短路，本单回池不排下一单，
+//     不再走「连续无数据」节奏（风控下重试=吃更多验证墙越试越升级）
+//   ②收起图标改圆形 64x64，收起即贴屏幕右侧正中（不跟随面板位置）
+//   ③做单间隔默认 0-1 秒（无单轮询仍听中枢 waitMs，不被默认值带偏）
+//   ④noitem 上报格式复核：中枢 submitTask 对齐 Ajie 字段 1:1，聚星近期 12 单
+//     via=noitem 全部 data.code=SUCCESS（audit 实证），格式无误
+//
 // v0.5.72（2026-11-28）：验收门阈值纠偏（全灭真根因，0x3a5e0 逐指令核实）——
 //   v0.5.31 十字段门把 cmp #2 cset hi 误读成「最多缺2=至少8个非空」，
 //   Ajie 实际语义 = 非空数 > 2（≥3 即收）。新版 app pdp/get 字段变瘦：
@@ -1695,9 +1703,9 @@ static void ahaLog(NSString *lv, NSString *msg) {
   });
 }
 
-// —— 调度（间隔默认 0-0 秒：池子没单时听中枢 waitMs 节奏）——
+// —— 调度（间隔默认 0-1 秒 v0.5.73：池子没单时听中枢 waitMs 节奏）——
 - (double)randomGap {
-  double lo = [self num:@"gapMin" def:0], hi = [self num:@"gapMax" def:0];
+  double lo = [self num:@"gapMin" def:0], hi = [self num:@"gapMax" def:1];
   if (hi < lo) hi = lo;
   return lo + arc4random_uniform((UInt32)(hi - lo + 1));
 }
@@ -1893,7 +1901,8 @@ static void ahaLog(NSString *lv, NSString *msg) {
         NSDictionary *t = j[@"task"];
         if (![t isKindOfClass:[NSDictionary class]] || !t.count) {
           // 没单时的等待节奏：用户在面板设了间隔（非 0-0）→ 按自己设的来；
-          // 默认 0-0 才听中枢 waitMs 派单节奏（v0.5.7 前一直被中枢 3s 盖住）
+          // 默认（未显式填间隔）仍听中枢 waitMs 派单节奏；v0.5.73 做单间隔默认 0-1 不影响这里——
+          // def 保持 0-0 判据，只有用户在面板显式填了间隔才覆盖中枢节奏（空池 0-1s 狂轮询会把中枢打爆）
           NSInteger glo = [self num:@"gapMin" def:0], ghi = [self num:@"gapMax" def:0];
           double wait;
           if (glo > 0 || ghi > 0) {
@@ -2001,7 +2010,9 @@ static void ahaLog(NSString *lv, NSString *msg) {
        连续 1 次全空=放弃本单继续下一单，连续 2 次=noteCaptureFailure 内部 riskStop。 */
     /* v0.5.64 用户令节奏：进入商品后 5s 没截到包 → 重试（重进商品页），最多重试 2 次（共 3 轮×5s）。
        （v0.5.52 的 15s 单轮硬顶由此替代；noitem 双通道在每轮里照常生效，命中即提交不重试） */
-    for (int attempt = 0; attempt < 3 && !capInfo; attempt++) {
+    /* v0.5.73 用户令：检测到风控（90309999 已 riskStop）立即放弃本单，重试循环整体短路——
+       风控下重进商品页只会吃更多验证墙，越试越升级 */
+    for (int attempt = 0; attempt < 3 && !capInfo && !gPool.risk; attempt++) {
       if (attempt > 0) {
         // v0.5.67 用户令：重试必须先退出商品页（回根）再进——人还在商品页上直接 openURL
         // 同一链接，app 认为「已在详情页」不重新加载，只吃缓存渲染，永远截不到新包。
@@ -2014,12 +2025,13 @@ static void ahaLog(NSString *lv, NSString *msg) {
               dispatch_get_main_queue(), ^{
             /* v0.5.71 重试 = 完整重走 Ajie 导航梯（内路由→直开→UL），与首次进详情完全同款——
                Ajie 重试就是整跑 openCurrentTask；此前重试只发 UL，内路由层级根本没参与 */
+            if (gPool.risk) return;   /* v0.5.73 风控后迟到的重试导航不再执行 */
             ahaNavigateToProduct(shopId, itemId, taskUrl);
             ahaObserveBegin();   /* 观察窗归零重计本单 */
           });
         });
       }
-      for (int i = 0; i < 10 && !capInfo; i++) {
+      for (int i = 0; i < 10 && !capInfo && !gPool.risk; i++) {   // v0.5.73 风控即断，不再干等
       [NSThread sleepForTimeInterval:0.5];
       // v0.5.53 noitem：等包期间收到错误回包信号 → 立即提交错误报文，
       // 不等 15s 超时（窗口端 v7.121 同款：立即放行提交，白等十几秒一单纯浪费）
@@ -2065,7 +2077,13 @@ static void ahaLog(NSString *lv, NSString *msg) {
          连续 1 次全空 → 放弃本单继续下一单（failStreak=1，下面 scheduleNext 照常领新单）；
          连续 2 次 → noteCaptureFailure 内部 riskStop（handleRiskControlDetected 同款）。
          截到包的下一单会把 failStreak 清零（body 分支），波动自愈。 */
-      [self noteCaptureFailure:NO];
+      /* v0.5.73 用户令：风控停机后不再走「连续无数据」节奏——那是给没抓到包的单用的，
+         风控单走它会白打一条「连续两次未获取到数据」噪音日志 */
+      if (self.risk) {
+        ahaLog(@"w", @"已风控，本单作废（不再重试）");
+      } else {
+        [self noteCaptureFailure:NO];
+      }
       // v0.5.52 超时诊断（观察窗 v0.528 改静默后数据白丢——把关键三数打回来）：
       // pdp请求=0 且页面在列表 = 导航没真开/白板页；pdp请求>0 = 发了但回包没进门（另查）
       dispatch_async(dispatch_get_main_queue(), ^{
@@ -2112,12 +2130,14 @@ static void ahaLog(NSString *lv, NSString *msg) {
     });
     dispatch_async(self.q, ^{
       if (!body) {
-        ahaLog(@"w", @"采集超时，任务回池");
+        /* v0.5.73：风控停机时本单照常回池（别设备可领），但不再排下一单——
+           scheduleNext 虽有 running 守卫兜底，这里显式短路，语义一目了然 */
+        ahaLog(@"w", self.risk ? @"风控停机中，任务回池（循环已停）" : @"采集超时，任务回池");
         self.taskLine = @"";
         ahaRefreshUI();
         [self api:@"/api/pool/report" method:@"POST"
             body:@{ @"taskId": taskId, @"profileId": pid, @"status": @"skip" } done:nil];
-        [self scheduleNext:[self randomGap]];
+        if (!self.risk) [self scheduleNext:[self randomGap]];
         return;
       }
       self.taskLine = [NSString stringWithFormat:@"#%@ · 上传中（%@，%lu KB）",
@@ -2536,7 +2556,7 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
 
   // 账号（敞口：无密码）+ 间隔；休息默认折叠成一个按钮，点开展开
   self.userField = AhaField(@"账号（中枢后台账号）", @"👤");
-  self.gapField = AhaField(@"间隔秒 0-0", @"⏱");
+  self.gapField = AhaField(@"间隔秒 0-1", @"⏱");
   self.gapField.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
   [p addSubview:self.userField];
   [p addSubview:self.gapField];
@@ -2608,15 +2628,15 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   [p addSubview:self.rh];
   [self.rh addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:p action:@selector(ahaResize:)]];
 
-  // 收起小球（v0.5.36 加大：64x30→86x44，像 Ajie 一样一眼能看清「成 N」）
-  UIView *mv = [[UIView alloc] initWithFrame:CGRectMake(scr.size.width - 100, scr.size.height * 0.16, 86, 44)];
+  // v0.5.73 收起图标改圆形（64x64）+ 默认贴屏幕右侧正中（用户令）
+  UIView *mv = [[UIView alloc] initWithFrame:CGRectMake(scr.size.width - 78, (scr.size.height - 64) / 2, 64, 64)];
   mv.backgroundColor = AhaColor(28, 120, 240, 0.95);
-  mv.layer.cornerRadius = 22;
+  mv.layer.cornerRadius = 32;
   mv.hidden = YES;
   self.mini = mv;
   self.miniInfo = [[UILabel alloc] initWithFrame:mv.bounds];
   self.miniInfo.textAlignment = NSTextAlignmentCenter;
-  self.miniInfo.font = [UIFont boldSystemFontOfSize:16];
+  self.miniInfo.font = [UIFont boldSystemFontOfSize:14];
   self.miniInfo.textColor = [UIColor whiteColor];
   [mv addSubview:self.miniInfo];
   UITapGestureRecognizer *mvTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(miniTapped)];
@@ -2643,9 +2663,9 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
       | UIControlEventTouchUpOutside | UIControlEventTouchCancel | UIControlEventTouchDragExit];
   ahaTap(self.resetBtn, ^{ [self.panel endEditing:YES]; [gPool resetCounters]; ahaLog(@"i", @"计数已清零"); });
 
-  // 输入框预填（间隔默认 0-0；休息按分钟显示，内部存秒）+ 失焦保存
+  // 输入框预填（间隔默认 0-1 v0.5.73；休息按分钟显示，内部存秒）+ 失焦保存
   self.userField.text = gPool.cfg[@"user"] ?: @"";
-  NSInteger lo = [gPool num:@"gapMin" def:0], hi = [gPool num:@"gapMax" def:0];
+  NSInteger lo = [gPool num:@"gapMin" def:0], hi = [gPool num:@"gapMax" def:1];
   self.gapField.text = [NSString stringWithFormat:@"%ld-%ld", (long)lo, (long)hi];
   self.restEveryField.text = [NSString stringWithFormat:@"%ld", (long)[gPool num:@"restEvery" def:0]];
   NSInteger mins0 = ([gPool num:@"restSec" def:0]) / 60;
@@ -2756,7 +2776,8 @@ static UIButton *AhaBtn(NSString *title, UIColor *bg, CGFloat size) {
   self.mini.hidden = !mini;
   if (mini) {
     CGRect scr = [UIScreen mainScreen].bounds;
-    self.mini.frame = CGRectMake(scr.size.width - 100, MIN(MAX(self.panel.frame.origin.y + 20, 60), scr.size.height - 70), 86, 44);
+    // v0.5.73 收起即回右侧正中（圆形 64x64，右缘留 14pt），不跟随面板拖动位置
+    self.mini.frame = CGRectMake(scr.size.width - 78, (scr.size.height - 64) / 2, 64, 64);
     self.miniInfo.text = [NSString stringWithFormat:@"成 %ld", (long)gPool.ok];
   }
 }
