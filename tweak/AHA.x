@@ -1955,8 +1955,11 @@ static void ahaLog(NSString *lv, NSString *msg) {
        睡在后台队列，不堵 _q / 主线程。 */
     /* v0.5.49 提交对齐 Ajie：url/rawResponseUrl = 产出包体的真实来源 URL（0x372a0 实证），
        并把「来源通道」上报中枢留证（审核通过率按通道归因）。 */
-    __block NSDictionary *capInfo = nil, *dirInfo = nil;
-    __block BOOL directFired = NO;
+    __block NSDictionary *capInfo = nil;
+    /* v0.5.63 用户令对齐 Ajie：兜底直连整体删除（0x23b80 反汇编实证 Ajie 对没截到的单直接丢弃，
+       从无任何直连/备用方案）。今日实战 48 单直连 0 胜=纯摆设，还留「启用备用方案」误导日志。
+       「你尋找的商品已不存在」不受影响：noitem 报文信号 + 弹窗文案识别双通道照旧，
+       命中即提交错误报文，聚星收了算成单（用户令：这类单必须提交，有钱）。 */
     __block NSString *pageNoItemHit = nil, *pageSample = nil;   // v0.5.56 主线程页面扫描结果回传
     /* v0.5.52 对齐 Ajie 时序（0x321d8 看门狗 15s + 0x31560 pdpContextReady 门）：
        ①总等待 15s 硬顶——旧版失败一单烧 35s（首轮 15s + 直连已死后还空等 20s），
@@ -1964,7 +1967,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
        ②直连点火加 pdpContextReady 门：app 90 秒内没发过 pdp 请求（页面没真开过）就不点火——
          get_pc/get 模板是死端点（SGW 418），点了纯噪音还留 418 记录（Ajie 同门）
        ③直连结果只在 15s 窗口内收，超窗弃单（Ajie 同） */
-    for (int i = 0; i < 30 && !capInfo && !dirInfo; i++) {
+    for (int i = 0; i < 30 && !capInfo; i++) {
       [NSThread sleepForTimeInterval:0.5];
       // v0.5.53 noitem：等包期间收到错误回包信号 → 立即提交错误报文，
       // 不等 15s 超时（窗口端 v7.121 同款：立即放行提交，白等十几秒一单纯浪费）
@@ -1998,24 +2001,10 @@ static void ahaLog(NSString *lv, NSString *msg) {
       }
       NSDictionary *ci = [[AHACapture shared] bodyInfoForShop:shopId item:itemId];
       if ([(NSString *)ci[@"body"] length] > 100) { capInfo = ci; break; }
-      // v0.5.59 直连门纠偏（用户截图实锤：死商品页还在点火直连）：旧条件 freshPdpURL 是
-      // 跨单 90s 残留——上一单的 pdp URL 还在窗口里门就开了。改用本单 gObsPdp>0
-      // （ahaObserveBegin 每次导航清零）= Ajie pdpContextReady 同款语义：本单 app 真发了
-      // pdp 请求（页面真开）才允许兜底；死商品页 pdp=0 → 绝不点火。正常商品没抓到包照常兜底
-      if (!directFired && i >= 9 && gObsPdp > 0) {
-        directFired = YES;
-        ahaLog(@"i", @"截包偏慢，直连并行兜底");
-        ahaStep(@"任务:DirectPDP并行");
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-          NSDictionary *di = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
-          if (di) dirInfo = di;
-        });
-      }
     }
-    NSDictionary *info = capInfo;   // 谁先回用谁（截包优先）
+    NSDictionary *info = capInfo;   // v0.5.63 只剩截包一条道（Ajie 同款，无兜底赛跑）
     BOOL noItem = [[info objectForKey:@"noitem"] boolValue];   // v0.5.53 商品不存在单
     NSString *via = noItem ? @"noitem" : @"app截包";
-    if (!info && dirInfo) { info = dirInfo; via = @"DirectPDP"; }
     NSString *body = info[@"body"];
     if (!body) {
       // 截包 + 直连双通道都没拿到 = 页面没开/没发 get_pc → 才计连续失败
@@ -2039,7 +2028,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
         }
         // v0.5.59 用户令（Ajie 没有的增强，0x23b80 反汇编实证它对没抓到的单直接丢弃）：
         // 没抓到的单也把全部证据传中枢存档 miss.jsonl，事后要分析随时拉。
-        // 证据：pdp/全部请求数、页面 topVC、页面文案样本、窗内 error 回包（截 500 字）、直连是否点火过
+        // 证据：pdp/全部请求数、页面 topVC、页面文案样本、窗内 error 回包（截 500 字）
         NSString *pniUrl = pni[@"url"] ?: @"";
         NSString *pniBody = [NSString stringWithFormat:@"%@", pni[@"body"] ?: @""];
         if (pniBody.length > 500) pniBody = [pniBody substringToIndex:500];
@@ -2048,27 +2037,17 @@ static void ahaLog(NSString *lv, NSString *msg) {
         [self api:@"/api/pool/miss" method:@"POST"
             body:@{ @"taskId": taskId, @"itemId": itemId ?: @"", @"shopId": shopId ?: @"",
                     @"taskUrl": taskUrl ?: @"", @"pid": pid ?: @"", @"acct": acct ?: @"",
-                    @"pdp": @(gObsPdp), @"any": @(gObsAny), @"direct": @(directFired),
+                    @"pdp": @(gObsPdp), @"any": @(gObsAny), @"direct": @NO,   // v0.5.63 兜底已删，字段留空保 miss.jsonl 结构稳定
                     @"topVC": NSStringFromClass([vc class]) ?: @"", @"page": ps,
                     @"errUrl": pniUrl, @"errBody": pniBody,
                     @"resp": (gMissResp ? [gMissResp copy] : @[]) }   // v0.5.59 窗口全部回包（URL+码+长度+前200字）
              done:nil];
         ahaObserveFlush();
       });
-      if (!directFired) {
-        if (gObsPdp == 0) {   // v0.5.59 本单没发过 pdp（页面没真开/商品不存在），不打直连
-          ahaLog(@"w", @"本单无 pdp 请求（页面没真开或商品不存在），跳过直连");
-        } else {
-          ahaLog(@"i", @"明细超时，直调兜底");
-          ahaStep(@"任务:DirectPDP兜底");
-          info = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
-          via = @"DirectPDP";
-          body = info[@"body"];
-          if (!body) ahaLog(@"w", @"直连失败，不计入风控");
-        }
-      } else {
-        ahaLog(@"w", @"直连并行也没拿到，任务回池");
-      }
+      /* v0.5.63 对齐 Ajie：删超时后同步直调兜底（0x23b80 实证 Ajie 无任何兜底，
+         没截到的单直接 finishCurrentTaskAndContinue 下一单）。
+         15s 没截到 = 弃单回池，面板明说，不再有「备用方案」 */
+      ahaLog(@"w", @"15s 没截到包，弃单回池（Ajie 同款无兜底）");
     }
     if (body) dispatch_async(self.q, ^{ self.failStreak = 0; gPool.risk = NO; });
     // 白板自清理：这一单走完（成/败都一样），把商品页退掉——
