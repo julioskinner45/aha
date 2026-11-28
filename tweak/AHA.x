@@ -14,6 +14,7 @@
 // v0.5.13（2026-11-24）：导航/风控/日志/验券 全面对照 Ajie 反汇编 1:1 重做——
 //   导航=openCurrentTask 时序（popToRoot→0.35s→内路由→失败 Universal Link openURL 兜底，不再 Direct PDP 当导航用）；
 //   风控=删弹窗，266900002 按正常响应提交，90309999 自动停，直连失败不计风控，连续 2 次无数据自动暂停；
+//   v0.5.64 等包节奏=5s/轮×重试2次（重进商品页），3轮全空=任务回池+脚本暂停（用户令）
 //   日志=[HH:mm:ss] 时间戳+去噪（第三方挂钩/观察窗不再刷屏）+0.25s 合并刷新修乱跳；
 //   验券=优惠券检测（start/report 契约 1:1，设置里填后端用户ID开启）
 //   1. 导航管理器解析：BTAppManager/BTApplicationAddonProvider/SHPNavigator 三类候选
@@ -1961,17 +1962,23 @@ static void ahaLog(NSString *lv, NSString *msg) {
        「你尋找的商品已不存在」不受影响：noitem 报文信号 + 弹窗文案识别双通道照旧，
        命中即提交错误报文，聚星收了算成单（用户令：这类单必须提交，有钱）。 */
     __block NSString *pageNoItemHit = nil, *pageSample = nil;   // v0.5.56 主线程页面扫描结果回传
-    /* v0.5.52 对齐 Ajie 时序（0x321d8 看门狗 15s + 0x31560 pdpContextReady 门）：
-       ①总等待 15s 硬顶——旧版失败一单烧 35s（首轮 15s + 直连已死后还空等 20s），
-         Ajie 看门狗就是 15s，到点 finishCurrentTaskAndContinue 直接下一单
-       ②直连点火加 pdpContextReady 门：app 90 秒内没发过 pdp 请求（页面没真开过）就不点火——
-         get_pc/get 模板是死端点（SGW 418），点了纯噪音还留 418 记录（Ajie 同门）
-       ③直连结果只在 15s 窗口内收，超窗弃单（Ajie 同） */
-    for (int i = 0; i < 30 && !capInfo; i++) {
+    /* v0.5.64 用户令节奏：进入商品后 5s 没截到包 → 重试（重进商品页），最多重试 2 次（共 3 轮×5s）；
+       3 轮全空 = 任务回池 + 脚本暂停——八成是风控/验证墙，别再烧单。
+       （v0.5.52 的 15s 单轮硬顶由此替代；noitem 双通道在每轮里照常生效，命中即提交不重试） */
+    for (int attempt = 0; attempt < 3 && !capInfo; attempt++) {
+      if (attempt > 0) {
+        ahaLog(@"w", [NSString stringWithFormat:@"第 %ld 次重试：重进商品页再等 5 秒", (long)attempt]);
+        ahaStep(@"任务:重试重进商品");
+        dispatch_async(dispatch_get_main_queue(), ^{
+          ahaOpenUniversalLink(shopId, itemId, taskUrl);
+          ahaObserveBegin();   /* 观察窗归零重计本单 */
+        });
+      }
+      for (int i = 0; i < 10 && !capInfo; i++) {
       [NSThread sleepForTimeInterval:0.5];
       // v0.5.53 noitem：等包期间收到错误回包信号 → 立即提交错误报文，
       // 不等 15s 超时（窗口端 v7.121 同款：立即放行提交，白等十几秒一单纯浪费）
-      if (i == 0) [[AHACapture shared] clearNoItem];
+      if (attempt == 0 && i == 0) [[AHACapture shared] clearNoItem];   // 只在首轮开局清残留；重试轮不丢已到的 noitem 信号
       if (!capInfo) {
         NSDictionary *ni = [[AHACapture shared] takeNoItemForShop:shopId item:itemId];
         if (ni) { capInfo = @{ @"body": ni[@"body"] ?: @"", @"url": ni[@"url"] ?: @"", @"noitem": @YES }; break; }
@@ -2001,15 +2008,17 @@ static void ahaLog(NSString *lv, NSString *msg) {
       }
       NSDictionary *ci = [[AHACapture shared] bodyInfoForShop:shopId item:itemId];
       if ([(NSString *)ci[@"body"] length] > 100) { capInfo = ci; break; }
+      }   // 内层 5s 轮结束（v0.5.64 外层 attempt）
     }
     NSDictionary *info = capInfo;   // v0.5.63 只剩截包一条道（Ajie 同款，无兜底赛跑）
     BOOL noItem = [[info objectForKey:@"noitem"] boolValue];   // v0.5.53 商品不存在单
     NSString *via = noItem ? @"noitem" : @"app截包";
     NSString *body = info[@"body"];
     if (!body) {
-      // 截包 + 直连双通道都没拿到 = 页面没开/没发 get_pc → 才计连续失败
-      //（旧版「截包超时」就计，直连救回来也白计，连续 2 次还误触风控暂停）
-      dispatch_async(self.q, ^{ [self noteCaptureFailure:NO]; });
+      /* v0.5.64 用户令：3 轮重试全空 = 任务回池 + 脚本立即暂停（原先连续 2 次才停太宽容，
+         一单烧 3 轮还不停 = 后面全是同款死页/验证墙，停了人工看） */
+      ahaLog(@"e", @"3 轮重试全没截到包，任务回池并暂停（疑似风控/验证墙）");
+      dispatch_async(self.q, ^{ [self riskStop]; });
       // v0.5.52 超时诊断（观察窗 v0.528 改静默后数据白丢——把关键三数打回来）：
       // pdp请求=0 且页面在列表 = 导航没真开/白板页；pdp请求>0 = 发了但回包没进门（另查）
       dispatch_async(dispatch_get_main_queue(), ^{
@@ -2044,10 +2053,8 @@ static void ahaLog(NSString *lv, NSString *msg) {
              done:nil];
         ahaObserveFlush();
       });
-      /* v0.5.63 对齐 Ajie：删超时后同步直调兜底（0x23b80 实证 Ajie 无任何兜底，
-         没截到的单直接 finishCurrentTaskAndContinue 下一单）。
-         15s 没截到 = 弃单回池，面板明说，不再有「备用方案」 */
-      ahaLog(@"w", @"15s 没截到包，弃单回池（Ajie 同款无兜底）");
+      /* v0.5.64 用户令：3 轮重试全空 → 任务回池 + 脚本暂停（开头已 riskStop，
+         这里走正常回池上报，scheduleNext 不会再领新单——running 已 NO） */
     }
     if (body) dispatch_async(self.q, ^{ self.failStreak = 0; gPool.risk = NO; });
     // 白板自清理：这一单走完（成/败都一样），把商品页退掉——
