@@ -14,7 +14,10 @@
 // v0.5.13（2026-11-24）：导航/风控/日志/验券 全面对照 Ajie 反汇编 1:1 重做——
 //   导航=openCurrentTask 时序（popToRoot→0.35s→内路由→失败 Universal Link openURL 兜底，不再 Direct PDP 当导航用）；
 //   风控=删弹窗，266900002 按正常响应提交，90309999 自动停，直连失败不计风控，连续 2 次无数据自动暂停；
-//   v0.5.64 等包节奏=5s/轮×重试2次（重进商品页），3轮全空=任务回池+脚本暂停（用户令）
+//   v0.5.64 等包节奏=5s/轮×重试2次（重进商品页），3轮全空+直连终审也空=任务回池+脚本暂停（用户令）
+//   v0.5.66 直连终审（Ajie 0.1.3 Direct PDP 反汇编 0x3d588/0x2bcfc/0x2fd04 对齐）：
+//     3轮截包全空后用记住的真实请求头直连 get_pc——回包=商品数据（提交）/266900002（死商品→提交）/
+//     90309999（墙→回池+暂停）。实锤场景：页面渲染完整但 app 不发数据请求（缓存渲染/反爬静默），截包永远空
 //   日志=[HH:mm:ss] 时间戳+去噪（第三方挂钩/观察窗不再刷屏）+0.25s 合并刷新修乱跳；
 //   验券=优惠券检测（start/report 契约 1:1，设置里填后端用户ID开启）
 //   1. 导航管理器解析：BTAppManager/BTApplicationAddonProvider/SHPNavigator 三类候选
@@ -746,6 +749,8 @@ static UIViewController *ahaResolvedTopVC(void) {
 // 所有私有类读取 @try 包，读不到就跳过，绝不因识别逻辑崩掉采集。
 static BOOL ahaNoItemTextMatch(NSString *s) {
   if (s.length == 0) return NO;
+  // 「售完即止」是促销话术不是售罄标（数量有限售完即止=正常在售商品），先排除再匹配
+  if ([s rangeOfString:@"售完即止"].location != NSNotFound) return NO;
   static NSArray *pats = nil;
   static dispatch_once_t once;
   dispatch_once(&once, ^{
@@ -753,7 +758,10 @@ static BOOL ahaNoItemTextMatch(NSString *s) {
              @"此商品不存在", @"商品不存在", @"商品已下架", @"商品已被下架", @"查無此商品",
              @"查无此商品", @"找不到此商品", @"此商品已刪除", @"商品已刪除", @"商品已被刪除",
              @"此商品已删除", @"商品已删除", @"商品已被删除", @"此商品已停售", @"商品已停售",
-             @"無法查看此商品", @"无法查看此商品", @"無法瀏覽此商品", @"无法浏览此商品"];
+             @"無法查看此商品", @"无法查看此商品", @"無法瀏覽此商品", @"无法浏览此商品",
+             // v0.5.66 miss.jsonl 新增死单类型（页面渲染完整但 0 数据请求）：
+             // 售完 badge（RNViewController 商品图角落）+ 卖家休假模式页
+             @"售完", @"賣家目前正在休假模式", @"卖家目前正在休假模式", @"目前正在休假模式"];
   });
   for (NSString *p in pats) if ([s rangeOfString:p].location != NSNotFound) return YES;
   return NO;
@@ -2014,6 +2022,26 @@ static void ahaLog(NSString *lv, NSString *msg) {
     BOOL noItem = [[info objectForKey:@"noitem"] boolValue];   // v0.5.53 商品不存在单
     NSString *via = noItem ? @"noitem" : @"app截包";
     NSString *body = info[@"body"];
+    __block NSDictionary *diDirect = nil;   // v0.5.66 直连终审结果（miss 存档用）
+    if (!body) {
+      /* v0.5.66 对齐 Ajie 0.1.3 Direct PDP（0x3d588/0x2bcfc/0x2fd04 反汇编）：
+         Ajie 并非「无备用方案」——它是页面等 20s（waitingForPDP 看门狗）没等到 pdp 回包时，
+         用 rememberRequestContextFromRequest 存下的 app 真实请求头，自己直连 get_pc 终审：
+         回包要么是商品数据（提交）、要么 error 266900002（死商品→照样提交）、要么 90309999（墙→放弃）。
+         今晚 20:30 后 15 单全灭的实锤：页面渲染完整但 pdp请求=0 全部请求=2~3（纯埋点）——
+         app 压根不发数据请求（缓存渲染/反爬静默），截包永远空，只有直连能破局。
+         用户令保留：3 轮重试 + 失败回池暂停（直连终审也拿不到才停）。 */
+      ahaLog(@"i", @"3 轮没截到包，直连 get_pc 终审（Ajie 0.1.3 Direct PDP 同款）");
+      ahaStep(@"任务:DirectPDP终审");
+      diDirect = [self directFetchShop:shopId item:itemId taskUrl:taskUrl];
+      if (diDirect && [(NSString *)diDirect[@"body"] length] > 100) {
+        capInfo = diDirect; info = diDirect; body = diDirect[@"body"];
+        noItem = [[diDirect objectForKey:@"noitem"] boolValue];
+        via = noItem ? @"noitem" : @"DirectPDP";
+        ahaLog(@"i", [NSString stringWithFormat:@"直连终审拿到%@报文，提交",
+            noItem ? @"死商品" : @"商品"]);
+      }
+    }
     if (!body) {
       /* v0.5.64 用户令：3 轮重试全空 = 任务回池 + 脚本立即暂停（原先连续 2 次才停太宽容，
          一单烧 3 轮还不停 = 后面全是同款死页/验证墙，停了人工看） */
@@ -2046,7 +2074,7 @@ static void ahaLog(NSString *lv, NSString *msg) {
         [self api:@"/api/pool/miss" method:@"POST"
             body:@{ @"taskId": taskId, @"itemId": itemId ?: @"", @"shopId": shopId ?: @"",
                     @"taskUrl": taskUrl ?: @"", @"pid": pid ?: @"", @"acct": acct ?: @"",
-                    @"pdp": @(gObsPdp), @"any": @(gObsAny), @"direct": @NO,   // v0.5.63 兜底已删，字段留空保 miss.jsonl 结构稳定
+                    @"pdp": @(gObsPdp), @"any": @(gObsAny), @"direct": @(diDirect != nil),   // v0.5.66 直连终审已尝试
                     @"topVC": NSStringFromClass([vc class]) ?: @"", @"page": ps,
                     @"errUrl": pniUrl, @"errBody": pniBody,
                     @"resp": (gMissResp ? [gMissResp copy] : @[]) }   // v0.5.59 窗口全部回包（URL+码+长度+前200字）
@@ -2231,9 +2259,15 @@ static NSString *ahaDirectOnce(NSString *url, NSDictionary *ctx, NSTimeInterval 
     if (left < 2) break;
     BOOL wall = NO;
     NSString *out = ahaDirectOnce(url, ctx, MIN(15.0, left), &wall);
+    if (wall) break;   // 90309999 验证墙：直连环境下也被墙，别再烧候选
+    // v0.5.66 对齐 Ajie 0.1.3（0x30644 判定 + 0x2fd04 提交块反汇编）：直连回包含
+    // 非零 error（266900002 等）= 死商品信号，原样错误报文提交（Ajie 死商品也走提交块）；
+    // 90309999 例外（上面 wall 已拦）。真实商品数据仍走 owned+valid 质量门。
+    NSDictionary *ni = ahaNoItemFromBody(out, url);
+    if (ni && [(NSString *)ni[@"body"] length] > 100)
+      return @{ @"body": ni[@"body"], @"url": url, @"noitem": @YES };
     if (out.length > 100 && ahaPdpBodyOwned(out, itemId, shopId) && ahaPdpBodyValid(out))
-      return @{ @"body": out, @"url": url };
-    if (wall) break;
+      return @{ @"body": out, @"url": url, @"direct": @YES };
   }
   return nil;
 }
